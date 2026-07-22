@@ -130,6 +130,16 @@ export function createPlan(
   };
 }
 
+export function createInstalledUpdatePlans(statuses: ToolStatus[]): Plan[] {
+  const plans: Plan[] = [];
+  for (const status of statuses) {
+    const active = status.active;
+    if (!active || active.source === "unknown" || active.legacy) continue;
+    plans.push(createPlan(status, "update", active.source));
+  }
+  return plans;
+}
+
 export function isAllowedScriptUrl(url: string, allowedHosts: readonly string[]): boolean {
   try {
     const parsed = new URL(url);

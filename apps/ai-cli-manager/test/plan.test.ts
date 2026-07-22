@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { getTool } from "../src/catalog.ts";
-import { createPlan, executePlans, formatStep, isAllowedScriptUrl, sourceAvailability } from "../src/plan.ts";
+import { createInstalledUpdatePlans, createPlan, executePlans, formatStep, isAllowedScriptUrl, sourceAvailability } from "../src/plan.ts";
 import type { CommandRunner, ToolStatus } from "../src/types.ts";
 
 function status(id: "claude" | "pi"): ToolStatus {
@@ -90,4 +90,20 @@ test("命令超时后即使退出码为零也判定为失败", async () => {
   const [result] = await executePlans([plan], runner);
   assert.equal(result?.ok, false);
   assert.equal(result?.message, "命令执行超时。");
+});
+
+test("批量更新包含所有来源明确的已安装 CLI", () => {
+  const current = status("pi");
+  current.state = "installed_current";
+  const unknown = status("claude");
+  unknown.active = { ...unknown.active!, source: "unknown" };
+  unknown.state = "source_unknown";
+  const notInstalled = status("claude");
+  notInstalled.active = undefined;
+  notInstalled.installations = [];
+  notInstalled.state = "not_installed";
+
+  const plans = createInstalledUpdatePlans([current, unknown, notInstalled]);
+
+  assert.deepEqual(plans.map((plan) => [plan.tool, plan.operation, plan.source]), [["pi", "update", "npm"]]);
 });
