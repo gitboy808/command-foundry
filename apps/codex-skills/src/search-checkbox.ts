@@ -9,7 +9,7 @@ import {
   useEffect,
   useKeypress,
   usePagination,
-  usePrefix,
+  useRef,
   useState,
   type Status,
 } from "@inquirer/core";
@@ -30,15 +30,18 @@ function restoreSearchLine(
   query: string,
 ): void {
   readline.clearLine(0);
-  readline.write(query);
+  const mutableReadline = readline as typeof readline & { cursor: number; line: string };
+  mutableReadline.line = query;
+  mutableReadline.cursor = query.length;
 }
 
 export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfig>(
   (config, done) => {
     const theme = makeTheme();
     const [status, setStatus] = useState<Status>("idle");
-    const prefix = usePrefix({ status, theme });
+    const prefix = status === "done" ? theme.style.answer("✔") : "";
     const [query, setQuery] = useState(config.initialQuery ?? "");
+    const searchCursor = useRef((config.initialQuery ?? "").length);
     const [skills, setSkills] = useState(config.skills.map((skill) => ({ ...skill })));
     const [activePath, setActivePath] = useState<string>();
     const visibleSkills = searchSkills(skills, query);
@@ -50,15 +53,28 @@ export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfi
     }, []);
 
     useKeypress((key, readline) => {
+      const terminalKey = key as typeof key & { meta?: boolean; sequence?: string };
       if (isEnterKey(key)) {
         setStatus("done");
         done(skills.filter((skill) => skill.enabled).map((skill) => skill.path));
-      } else if (isBackspaceKey(key)) {
-        const nextQuery = query.slice(0, -1);
-        restoreSearchLine(readline, nextQuery);
-        setQuery(nextQuery);
+      } else if (
+        isBackspaceKey(key) ||
+        terminalKey.sequence === "\u007f" ||
+        terminalKey.sequence === "\b"
+      ) {
+        if (searchCursor.current > 0) {
+          const nextCursor = searchCursor.current - 1;
+          const nextQuery = `${query.slice(0, nextCursor)}${query.slice(searchCursor.current)}`;
+          restoreSearchLine(readline, nextQuery);
+          const mutableReadline = readline as typeof readline & { cursor: number };
+          mutableReadline.cursor = nextCursor;
+          searchCursor.current = nextCursor;
+          setQuery(nextQuery);
+        }
       } else if (visibleSkills.length > 0 && (isUpKey(key) || isDownKey(key))) {
         restoreSearchLine(readline, query);
+        const mutableReadline = readline as typeof readline & { cursor: number };
+        mutableReadline.cursor = searchCursor.current;
         const offset = isUpKey(key) ? -1 : 1;
         const next = config.loop
           ? (active + offset + visibleSkills.length) % visibleSkills.length
@@ -66,6 +82,8 @@ export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfi
         setActivePath(visibleSkills[next]!.path);
       } else if (visibleSkills.length > 0 && isSpaceKey(key)) {
         restoreSearchLine(readline, query);
+        const mutableReadline = readline as typeof readline & { cursor: number };
+        mutableReadline.cursor = searchCursor.current;
         const selected = visibleSkills[active]!;
         setSkills(
           skills.map((skill) =>
@@ -74,6 +92,8 @@ export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfi
         );
       } else if (visibleSkills.length > 0 && key.ctrl && key.name === "a") {
         restoreSearchLine(readline, query);
+        const mutableReadline = readline as typeof readline & { cursor: number };
+        mutableReadline.cursor = searchCursor.current;
         const visiblePaths = new Set(visibleSkills.map((skill) => skill.path));
         const enabled = visibleSkills.some((skill) => !skill.enabled);
         setSkills(
@@ -83,14 +103,35 @@ export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfi
         );
       } else if (visibleSkills.length > 0 && key.ctrl && key.name === "i") {
         restoreSearchLine(readline, query);
+        const mutableReadline = readline as typeof readline & { cursor: number };
+        mutableReadline.cursor = searchCursor.current;
         const visiblePaths = new Set(visibleSkills.map((skill) => skill.path));
         setSkills(
           skills.map((skill) =>
             visiblePaths.has(skill.path) ? { ...skill, enabled: !skill.enabled } : skill,
           ),
         );
+      } else if (key.name === "left" || key.name === "right") {
+        const offset = key.name === "left" ? -1 : 1;
+        const nextCursor = Math.max(
+          0,
+          Math.min(searchCursor.current + offset, query.length),
+        );
+        const mutableReadline = readline as typeof readline & { cursor: number };
+        mutableReadline.cursor = nextCursor;
+        searchCursor.current = nextCursor;
+        return;
       } else {
-        setQuery(readline.line);
+        const sequence = terminalKey.sequence ?? "";
+        if (!key.ctrl && !terminalKey.meta && sequence !== "" && !sequence.startsWith("\u001b")) {
+          const nextQuery = `${query.slice(0, searchCursor.current)}${sequence}${query.slice(searchCursor.current)}`;
+          const nextCursor = searchCursor.current + sequence.length;
+          restoreSearchLine(readline, nextQuery);
+          const mutableReadline = readline as typeof readline & { cursor: number };
+          mutableReadline.cursor = nextCursor;
+          searchCursor.current = nextCursor;
+          setQuery(nextQuery);
+        }
       }
     });
 
