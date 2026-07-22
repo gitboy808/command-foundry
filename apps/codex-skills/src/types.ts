@@ -11,7 +11,6 @@ export interface Skill {
 export interface ConfigSnapshot {
   path: string;
   contents: string;
-  hash: string;
   enabledByPath: Map<string, boolean>;
 }
 
@@ -49,6 +48,5 @@ export interface SkillSetStore {
 export interface SkillSetStoreSnapshot {
   path: string;
   contents: string;
-  hash: string;
   data: SkillSetStore;
 }

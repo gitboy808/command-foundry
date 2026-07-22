@@ -1,14 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import path from "node:path";
 import * as toml from "@iarna/toml";
+import { readTextFile, writeTextFileAtomically } from "./atomic-file.js";
 import type { ConfigSnapshot } from "./types.js";
 
 const SKILL_TABLE = "[[skills.config]]";
-
-function sha256(contents: string): string {
-  return createHash("sha256").update(contents).digest("hex");
-}
 
 function getSkillEntries(contents: string): Array<Record<string, unknown>> {
   if (contents.trim() === "") return [];
@@ -39,13 +33,8 @@ function enabledMap(contents: string): Map<string, boolean> {
 }
 
 export async function readConfig(configPath: string): Promise<ConfigSnapshot> {
-  let contents = "";
-  try {
-    contents = await readFile(configPath, "utf8");
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  return { path: configPath, contents, hash: sha256(contents), enabledByPath: enabledMap(contents) };
+  const contents = await readTextFile(configPath);
+  return { path: configPath, contents, enabledByPath: enabledMap(contents) };
 }
 
 interface TableBlock {
@@ -153,21 +142,10 @@ export function updateSkillStates(
 export async function writeConfigAtomically(snapshot: ConfigSnapshot, contents: string): Promise<void> {
   const current = await readConfig(snapshot.path);
   // 用户确认期间若配置被其他进程修改，拒绝用旧快照覆盖新内容。
-  if (current.hash !== snapshot.hash) {
+  if (current.contents !== snapshot.contents) {
     throw new Error("工具运行期间 config.toml 已被修改。请重新运行 codex-skills 后再试。");
   }
   if (contents === snapshot.contents) return;
 
-  const directory = path.dirname(snapshot.path);
-  await mkdir(directory, { recursive: true });
-  const tempPath = path.join(directory, `.${path.basename(snapshot.path)}.${randomUUID()}.tmp`);
-  let mode = 0o600;
-  try {
-    mode = (await stat(snapshot.path)).mode;
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  // 临时文件与目标文件位于同一目录，rename 可以原子替换配置。
-  await writeFile(tempPath, contents, { encoding: "utf8", mode, flag: "wx" });
-  await rename(tempPath, snapshot.path);
+  await writeTextFileAtomically(snapshot.path, contents);
 }

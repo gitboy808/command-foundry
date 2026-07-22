@@ -1,6 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import path from "node:path";
+import { readTextFile, writeTextFileAtomically } from "./atomic-file.js";
 import type {
   ProjectSkillSetGroup,
   SkillSet,
@@ -10,10 +8,6 @@ import type {
 } from "./types.js";
 
 export const MAX_SKILL_SETS = 3;
-
-function sha256(contents: string): string {
-  return createHash("sha256").update(contents).digest("hex");
-}
 
 export function emptySkillSetStore(): SkillSetStore {
   return {
@@ -130,20 +124,15 @@ export function parseSkillSetStore(contents: string): SkillSetStore {
 }
 
 export async function readSkillSetStore(storePath: string): Promise<SkillSetStoreSnapshot> {
-  let contents = "";
-  try {
-    contents = await readFile(storePath, "utf8");
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  return { path: storePath, contents, hash: sha256(contents), data: parseSkillSetStore(contents) };
+  const contents = await readTextFile(storePath);
+  return { path: storePath, contents, data: parseSkillSetStore(contents) };
 }
 
 export async function assertSkillSetStoreUnchanged(
   snapshot: SkillSetStoreSnapshot,
 ): Promise<void> {
   const current = await readSkillSetStore(snapshot.path);
-  if (current.hash !== snapshot.hash) {
+  if (current.contents !== snapshot.contents) {
     throw new Error("工具运行期间 codex-skills.json 已被修改。请重新运行后再试。");
   }
 }
@@ -159,21 +148,5 @@ export async function writeSkillSetStoreAtomically(
   parseSkillSetStore(contents);
   if (contents === snapshot.contents) return;
 
-  const directory = path.dirname(snapshot.path);
-  await mkdir(directory, { recursive: true });
-  const tempPath = path.join(directory, `.${path.basename(snapshot.path)}.${randomUUID()}.tmp`);
-  let mode = 0o600;
-  try {
-    mode = (await stat(snapshot.path)).mode;
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-
-  try {
-    await writeFile(tempPath, contents, { encoding: "utf8", mode, flag: "wx" });
-    await rename(tempPath, snapshot.path);
-  } catch (error) {
-    await unlink(tempPath).catch(() => undefined);
-    throw error;
-  }
+  await writeTextFileAtomically(snapshot.path, contents);
 }
