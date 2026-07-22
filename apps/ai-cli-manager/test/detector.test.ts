@@ -67,3 +67,65 @@ test("官方路径可识别，离线时不产生写入计划", async () => {
   assert.equal(status.active?.source, "official");
   assert.equal(status.state, "latest_unavailable");
 });
+
+test("空的 Codex standalone 目录不会阻止重新安装", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-test-"));
+  await mkdir(path.join(directory, ".codex", "packages", "standalone"), { recursive: true });
+
+  const status = await detectTool(getTool("codex")!, {
+    runner: new FakeRunner(path.join(directory, "empty")),
+    env: { PATH: "" },
+    home: directory,
+    platform: "linux",
+    network: false,
+  });
+
+  assert.equal(status.state, "not_installed");
+  assert.equal(status.installations.length, 0);
+});
+
+test("Windows 优先使用 PATHEXT 并识别 npm cmd shim", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-test-"));
+  const npmRoot = path.join(directory, "node_modules");
+  const packageRoot = path.join(npmRoot, "@moonshot-ai", "kimi-code");
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(path.join(packageRoot, "cli.js"), "#!/usr/bin/env node\n");
+  await writeFile(path.join(packageRoot, "package.json"), JSON.stringify({ version: "1.0.0", bin: { kimi: "cli.js" } }));
+  await writeFile(path.join(directory, "kimi"), "#!/bin/sh\n");
+  await writeFile(path.join(directory, "kimi.cmd"), "@echo off\r\nnode %~dp0\\node_modules\\@moonshot-ai\\kimi-code\\cli.js %*\r\n");
+
+  const status = await detectTool(getTool("kimi")!, {
+    runner: new FakeRunner(npmRoot),
+    env: { PATH: directory, PATHEXT: ".cmd;.exe" },
+    home: directory,
+    platform: "win32",
+    network: false,
+  });
+
+  assert.equal(status.active?.source, "npm");
+  assert.equal(status.active?.version, "1.0.0");
+});
+
+test("Windows npm cmd shim 只匹配实际指向的包", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-test-"));
+  const npmRoot = path.join(directory, "node_modules");
+  for (const [packageName, version] of [["@moonshot-ai/kimi-code", "1.0.0"], ["kimi-cli", "0.1.0"]]) {
+    const packageRoot = path.join(npmRoot, ...packageName.split("/"));
+    await mkdir(packageRoot, { recursive: true });
+    await writeFile(path.join(packageRoot, "cli.js"), "#!/usr/bin/env node\n");
+    await writeFile(path.join(packageRoot, "package.json"), JSON.stringify({ version, bin: { kimi: "cli.js" } }));
+  }
+  await writeFile(path.join(directory, "kimi.cmd"), "@echo off\r\nnode %~dp0\\node_modules\\kimi-cli\\cli.js %*\r\n");
+
+  const status = await detectTool(getTool("kimi")!, {
+    runner: new FakeRunner(npmRoot),
+    env: { PATH: directory, PATHEXT: ".cmd" },
+    home: directory,
+    platform: "win32",
+    network: false,
+  });
+
+  assert.equal(status.active?.packageName, "kimi-cli");
+  assert.equal(status.active?.legacy, true);
+  assert.equal(status.state, "source_unknown");
+});

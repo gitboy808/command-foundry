@@ -55,7 +55,10 @@ async function executable(filePath: string, platform: NodeJS.Platform): Promise<
 
 async function pathCandidates(command: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): Promise<PathCandidate[]> {
   const pathValue = env.PATH ?? "";
-  const extensions = platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
+  const pathExt = env.PATHEXT?.trim() || ".COM;.EXE;.BAT;.CMD";
+  const extensions = platform === "win32"
+    ? [...new Set(pathExt.split(";").filter(Boolean).map((extension) => `${extension.startsWith(".") ? "" : "."}${extension}`.toLowerCase()))]
+    : [""];
   const candidates: PathCandidate[] = [];
   const seen = new Set<string>();
   for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {
@@ -212,9 +215,29 @@ async function readLatest(tool: ToolDefinition, source: Source, inventory: NpmIn
   return undefined;
 }
 
-function samePath(left: string | undefined, right: string | undefined): boolean {
+function samePath(left: string | undefined, right: string | undefined, platform: NodeJS.Platform): boolean {
   if (!left || !right) return false;
-  return path.resolve(left) === path.resolve(right);
+  const normalize = (value: string): string => platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
+  return normalize(left) === normalize(right);
+}
+
+async function npmShimMatches(
+  candidate: PathCandidate,
+  inventory: NpmInventory,
+  command: string,
+  packagePath: string,
+  platform: NodeJS.Platform,
+): Promise<boolean> {
+  if (platform !== "win32" || !inventory.root) return false;
+  if (!samePath(candidate.path, path.join(path.dirname(inventory.root), `${command}.cmd`), platform)) return false;
+  try {
+    // Windows npm shim 不会解析到包内脚本，需从 shim 内容确认它实际指向哪个全局包。
+    const shim = (await readFile(candidate.path, "utf8")).replaceAll("\\", "/").toLowerCase();
+    const packageRelativePath = path.relative(path.dirname(inventory.root), packagePath).replaceAll("\\", "/").toLowerCase();
+    return shim.includes(packageRelativePath);
+  } catch {
+    return false;
+  }
 }
 
 function pathMatchesPrefix(candidate: PathCandidate, prefix: string | undefined, basePrefix?: string, packageName?: string, kind?: "formula" | "cask"): boolean {
@@ -226,12 +249,10 @@ function officialPathMatches(tool: ToolDefinition, candidate: PathCandidate, hom
   return Boolean(tool.official?.markers.some((marker) => candidate.realpath.includes(path.join(home, marker)) || candidate.path.includes(path.join(home, marker))));
 }
 
-async function officialMarkerExists(tool: ToolDefinition, home: string): Promise<string | undefined> {
+async function officialMarkerExists(tool: ToolDefinition, home: string, platform: NodeJS.Platform): Promise<string | undefined> {
   for (const marker of tool.official?.markers ?? []) {
     const markerPath = path.join(home, marker);
-    if (marker.endsWith(`/${tool.command}`) || marker.endsWith(`\\${tool.command}`)) {
-      if (await exists(markerPath)) return markerPath;
-    }
+    if (await executable(markerPath, platform)) return markerPath;
   }
   return undefined;
 }
@@ -270,7 +291,11 @@ export async function detectTool(tool: ToolDefinition, options: DetectOptions): 
   for (const [packageName, packageInfo] of npm.packages) {
     let packageBin = packageInfo.binPath;
     if (packageBin && !(await exists(packageBin))) packageBin = undefined;
-    const active = Boolean(activeCandidate && (samePath(activeCandidate.realpath, packageBin) || activeCandidate.realpath.startsWith(`${packageInfo.path}${path.sep}`)));
+    const active = Boolean(activeCandidate && (
+      samePath(activeCandidate.realpath, packageBin, platform)
+      || activeCandidate.realpath.startsWith(`${packageInfo.path}${path.sep}`)
+      || await npmShimMatches(activeCandidate, npm, tool.command, packageInfo.path, platform)
+    ));
     installations.push({
       source: "npm",
       path: packageBin ?? packageInfo.path,
@@ -326,7 +351,7 @@ export async function detectTool(tool: ToolDefinition, options: DetectOptions): 
   }
 
   const officialCandidate = activeCandidate && officialPathMatches(tool, activeCandidate, home) ? activeCandidate : undefined;
-  const markerPath = await officialMarkerExists(tool, home);
+  const markerPath = await officialMarkerExists(tool, home, platform);
   if (officialCandidate || markerPath) {
     const versionResult = officialCandidate ? await options.runner.run(officialCandidate.path, tool.versionArgs, { env }) : undefined;
     installations.push({
