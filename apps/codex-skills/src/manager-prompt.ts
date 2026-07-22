@@ -14,6 +14,7 @@ import {
   useState,
   type Status,
 } from "@inquirer/core";
+import { setPromptCursor, setPromptLine } from "./prompt-line.js";
 import { effectiveActiveSetId, ensureProjectGroup, skillsInScope } from "./skill-sets.js";
 import { searchSkills } from "./skills.js";
 import { MAX_SKILL_SETS } from "./store.js";
@@ -63,19 +64,6 @@ interface SetRow {
   kind: "default" | "set" | "create";
   scope: SkillSetScope;
   skillSet?: SkillSet;
-}
-
-interface PromptReadline {
-  line: string;
-  clearLine: (direction: 0 | 1 | -1) => void;
-  write: (data: string) => void;
-}
-
-function restoreLine(readline: PromptReadline, value: string): void {
-  readline.clearLine(0);
-  const mutableReadline = readline as PromptReadline & { cursor: number; line: string };
-  mutableReadline.line = value;
-  mutableReadline.cursor = value.length;
 }
 
 function isShiftTabKey(key: Key): boolean {
@@ -128,21 +116,19 @@ export const managerPrompt = createPrompt<ManagerAction, ManagerPromptConfig>((c
     const terminalKey = key as typeof key & { meta?: boolean; sequence?: string };
     const selectedPaths = skills.filter((skill) => skill.enabled).map((skill) => skill.path);
     if (isShiftTabKey(key)) {
-      restoreLine(readline, view === "skills" ? "" : query);
-      if (view === "sets") {
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
-      }
+      const nextQuery = view === "skills" ? "" : query;
+      setPromptLine(readline, nextQuery, view === "sets" ? searchCursor.current : 0);
       setView(view === "skills" ? "sets" : "skills");
       return;
     }
     const horizontalTarget = horizontalMenuTarget(view, query, key.name);
     if (horizontalTarget) {
-      restoreLine(readline, horizontalTarget === "sets" ? "" : query);
-      if (horizontalTarget === "skills") {
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
-      }
+      const nextQuery = horizontalTarget === "sets" ? "" : query;
+      setPromptLine(
+        readline,
+        nextQuery,
+        horizontalTarget === "skills" ? searchCursor.current : 0,
+      );
       setView(horizontalTarget);
       return;
     }
@@ -161,23 +147,17 @@ export const managerPrompt = createPrompt<ManagerAction, ManagerPromptConfig>((c
         if (searchCursor.current > 0) {
           const nextCursor = searchCursor.current - 1;
           const nextQuery = `${query.slice(0, nextCursor)}${query.slice(searchCursor.current)}`;
-          restoreLine(readline, nextQuery);
-          const mutableReadline = readline as typeof readline & { cursor: number };
-          mutableReadline.cursor = nextCursor;
+          setPromptLine(readline, nextQuery, nextCursor);
           searchCursor.current = nextCursor;
           setQuery(nextQuery);
         }
       } else if (visibleSkills.length > 0 && (isUpKey(key) || isDownKey(key))) {
-        restoreLine(readline, query);
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
+        setPromptLine(readline, query, searchCursor.current);
         const offset = isUpKey(key) ? -1 : 1;
         const next = Math.max(0, Math.min(active + offset, visibleSkills.length - 1));
         setActivePath(visibleSkills[next]!.path);
       } else if (visibleSkills.length > 0 && isSpaceKey(key)) {
-        restoreLine(readline, query);
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
+        setPromptLine(readline, query, searchCursor.current);
         const selected = visibleSkills[active]!;
         setSkills(
           skills.map((skill) =>
@@ -185,9 +165,7 @@ export const managerPrompt = createPrompt<ManagerAction, ManagerPromptConfig>((c
           ),
         );
       } else if (visibleSkills.length > 0 && key.ctrl && key.name === "a") {
-        restoreLine(readline, query);
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
+        setPromptLine(readline, query, searchCursor.current);
         const visiblePaths = new Set(visibleSkills.map((skill) => skill.path));
         const enabled = visibleSkills.some((skill) => !skill.enabled);
         setSkills(
@@ -196,9 +174,7 @@ export const managerPrompt = createPrompt<ManagerAction, ManagerPromptConfig>((c
           ),
         );
       } else if (visibleSkills.length > 0 && key.ctrl && key.name === "i") {
-        restoreLine(readline, query);
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
+        setPromptLine(readline, query, searchCursor.current);
         const visiblePaths = new Set(visibleSkills.map((skill) => skill.path));
         setSkills(
           skills.map((skill) =>
@@ -211,8 +187,7 @@ export const managerPrompt = createPrompt<ManagerAction, ManagerPromptConfig>((c
           0,
           Math.min(searchCursor.current + offset, query.length),
         );
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = nextCursor;
+        setPromptCursor(readline, nextCursor);
         searchCursor.current = nextCursor;
         return;
       } else {
@@ -220,9 +195,7 @@ export const managerPrompt = createPrompt<ManagerAction, ManagerPromptConfig>((c
         if (!key.ctrl && !terminalKey.meta && sequence !== "" && !sequence.startsWith("\u001b")) {
           const nextQuery = `${query.slice(0, searchCursor.current)}${sequence}${query.slice(searchCursor.current)}`;
           const nextCursor = searchCursor.current + sequence.length;
-          restoreLine(readline, nextQuery);
-          const mutableReadline = readline as typeof readline & { cursor: number };
-          mutableReadline.cursor = nextCursor;
+          setPromptLine(readline, nextQuery, nextCursor);
           searchCursor.current = nextCursor;
           setQuery(nextQuery);
         }
@@ -230,7 +203,7 @@ export const managerPrompt = createPrompt<ManagerAction, ManagerPromptConfig>((c
       return;
     }
 
-    restoreLine(readline, "");
+    setPromptLine(readline, "");
     if (!selectedSetRow) return;
     if (isUpKey(key) || isDownKey(key)) {
       const offset = isUpKey(key) ? -1 : 1;

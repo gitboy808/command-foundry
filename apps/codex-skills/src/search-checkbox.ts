@@ -13,6 +13,7 @@ import {
   useState,
   type Status,
 } from "@inquirer/core";
+import { setPromptCursor, setPromptLine } from "./prompt-line.js";
 import { searchSkills } from "./skills.js";
 import type { Skill } from "./types.js";
 
@@ -23,16 +24,6 @@ interface SearchableCheckboxConfig {
   initialQuery?: string;
   pageSize?: number;
   loop?: boolean;
-}
-
-function restoreSearchLine(
-  readline: { clearLine: (direction: 0 | 1 | -1) => void; write: (data: string) => void },
-  query: string,
-): void {
-  readline.clearLine(0);
-  const mutableReadline = readline as typeof readline & { cursor: number; line: string };
-  mutableReadline.line = query;
-  mutableReadline.cursor = query.length;
 }
 
 export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfig>(
@@ -65,25 +56,19 @@ export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfi
         if (searchCursor.current > 0) {
           const nextCursor = searchCursor.current - 1;
           const nextQuery = `${query.slice(0, nextCursor)}${query.slice(searchCursor.current)}`;
-          restoreSearchLine(readline, nextQuery);
-          const mutableReadline = readline as typeof readline & { cursor: number };
-          mutableReadline.cursor = nextCursor;
+          setPromptLine(readline, nextQuery, nextCursor);
           searchCursor.current = nextCursor;
           setQuery(nextQuery);
         }
       } else if (visibleSkills.length > 0 && (isUpKey(key) || isDownKey(key))) {
-        restoreSearchLine(readline, query);
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
+        setPromptLine(readline, query, searchCursor.current);
         const offset = isUpKey(key) ? -1 : 1;
         const next = config.loop
           ? (active + offset + visibleSkills.length) % visibleSkills.length
           : Math.max(0, Math.min(active + offset, visibleSkills.length - 1));
         setActivePath(visibleSkills[next]!.path);
       } else if (visibleSkills.length > 0 && isSpaceKey(key)) {
-        restoreSearchLine(readline, query);
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
+        setPromptLine(readline, query, searchCursor.current);
         const selected = visibleSkills[active]!;
         setSkills(
           skills.map((skill) =>
@@ -91,9 +76,7 @@ export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfi
           ),
         );
       } else if (visibleSkills.length > 0 && key.ctrl && key.name === "a") {
-        restoreSearchLine(readline, query);
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
+        setPromptLine(readline, query, searchCursor.current);
         const visiblePaths = new Set(visibleSkills.map((skill) => skill.path));
         const enabled = visibleSkills.some((skill) => !skill.enabled);
         setSkills(
@@ -102,9 +85,7 @@ export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfi
           ),
         );
       } else if (visibleSkills.length > 0 && key.ctrl && key.name === "i") {
-        restoreSearchLine(readline, query);
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = searchCursor.current;
+        setPromptLine(readline, query, searchCursor.current);
         const visiblePaths = new Set(visibleSkills.map((skill) => skill.path));
         setSkills(
           skills.map((skill) =>
@@ -117,8 +98,7 @@ export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfi
           0,
           Math.min(searchCursor.current + offset, query.length),
         );
-        const mutableReadline = readline as typeof readline & { cursor: number };
-        mutableReadline.cursor = nextCursor;
+        setPromptCursor(readline, nextCursor);
         searchCursor.current = nextCursor;
         return;
       } else {
@@ -126,9 +106,7 @@ export const searchableCheckbox = createPrompt<string[], SearchableCheckboxConfi
         if (!key.ctrl && !terminalKey.meta && sequence !== "" && !sequence.startsWith("\u001b")) {
           const nextQuery = `${query.slice(0, searchCursor.current)}${sequence}${query.slice(searchCursor.current)}`;
           const nextCursor = searchCursor.current + sequence.length;
-          restoreSearchLine(readline, nextQuery);
-          const mutableReadline = readline as typeof readline & { cursor: number };
-          mutableReadline.cursor = nextCursor;
+          setPromptLine(readline, nextQuery, nextCursor);
           searchCursor.current = nextCursor;
           setQuery(nextQuery);
         }
