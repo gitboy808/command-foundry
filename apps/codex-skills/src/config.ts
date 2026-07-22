@@ -56,7 +56,7 @@ interface TableBlock {
 
 function skillTableBlocks(contents: string): TableBlock[] {
   const headers = [
-    ...contents.matchAll(/^\s*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[^\r\n]*(?:\r?\n|$)/gm),
+    ...contents.matchAll(/^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[^\r\n]*(?:\r?\n|$)/gm),
   ];
   const skillHeaders = headers.filter((header) =>
     header[0].trimStart().startsWith(SKILL_TABLE),
@@ -88,6 +88,20 @@ function setEnabledInBlock(block: string, enabled: boolean): string {
   return `${block.replace(/(?:\r?\n)*$/, "")}${newline}enabled = ${value}${newline}`;
 }
 
+function commentsAfterBlock(block: string): string {
+  const lines = (block.match(/[^\r\n]*(?:\r\n|\n|$)/g) ?? []).filter(Boolean);
+  let lastContent = lines.length - 1;
+  while (lastContent >= 0) {
+    const line = lines[lastContent]?.trim() ?? "";
+    if (line !== "" && !line.startsWith("#")) break;
+    lastContent--;
+  }
+
+  const trailing = lines.slice(lastContent + 1);
+  const firstComment = trailing.findIndex((line) => line.trimStart().startsWith("#"));
+  return firstComment === -1 ? "" : trailing.slice(firstComment).join("");
+}
+
 function appendSkillBlock(contents: string, skillPath: string, enabled: boolean): string {
   const newline = contents.includes("\r\n") ? "\r\n" : "\n";
   const prefix = contents.length === 0 ? "" : contents.endsWith(newline) ? newline : `${newline}${newline}`;
@@ -102,11 +116,15 @@ export function updateSkillStates(
   const blocks = skillTableBlocks(contents);
   const replacements = new Map<TableBlock, string>();
 
-  // 只替换目标 [[skills.config]] 的源码范围，保留其他配置、顺序和注释。
+  // false 保留并更新覆盖块；true 删除覆盖块，让 Codex 回落到默认启用状态。
   for (const block of blocks) {
     const skillPath = pathInBlock(block.contents);
     if (!skillPath || !requested.has(skillPath)) continue;
-    replacements.set(block, setEnabledInBlock(block.contents, requested.get(skillPath)!));
+    const enabled = requested.get(skillPath)!;
+    replacements.set(
+      block,
+      enabled ? commentsAfterBlock(block.contents) : setEnabledInBlock(block.contents, false),
+    );
   }
 
   let updated = "";
@@ -124,7 +142,7 @@ export function updateSkillStates(
   }
 
   for (const [skillPath, enabled] of requested) {
-    updated = appendSkillBlock(updated, skillPath, enabled);
+    if (!enabled) updated = appendSkillBlock(updated, skillPath, false);
   }
 
   // 写入文件系统前校验生成的 TOML 文本。

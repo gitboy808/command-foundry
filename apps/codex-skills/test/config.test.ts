@@ -65,6 +65,41 @@ test("更新所有匹配表以避免重复覆盖项状态不一致", () => {
   assert.match(result, new RegExp(`path = ${JSON.stringify(findSkillsPath)}\\nenabled = true`));
 });
 
+test("启用技能时删除所有匹配覆盖项并保留其他配置", () => {
+  const source = [
+    'model = "gpt-5.6-sol"',
+    "",
+    "[[skills.config]]",
+    `path = ${JSON.stringify(imagegenPath)}`,
+    "enabled = false",
+    "",
+    "[[skills.config]]",
+    `path = ${JSON.stringify(findSkillsPath)}`,
+    "enabled = false",
+    "",
+    "[[skills.config]]",
+    `path = ${JSON.stringify(imagegenPath)}`,
+    "enabled = true",
+    "",
+    "# 保留后续配置说明",
+    "[features]",
+    "js_repl = false",
+    "",
+  ].join("\n");
+
+  const result = updateSkillStates(source, new Map([[imagegenPath, true]]));
+
+  assert.doesNotMatch(result, new RegExp(JSON.stringify(imagegenPath).replaceAll("/", "\\/")));
+  assert.match(result, new RegExp(`path = ${JSON.stringify(findSkillsPath)}\\nenabled = false`));
+  assert.match(result, /# 保留后续配置说明\n\[features\]\njs_repl = false/);
+});
+
+test("启用没有覆盖项的技能时不新增冗余配置", () => {
+  const source = 'model = "gpt-5.6-sol"\n';
+
+  assert.equal(updateSkillStates(source, new Map([[imagegenPath, true]])), source);
+});
+
 test("原子写入并拒绝覆盖并发配置变更", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "codex-skills-config-"));
   const configPath = path.join(directory, "config.toml");
