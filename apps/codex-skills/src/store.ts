@@ -65,6 +65,9 @@ function parseGroup(value: unknown, location: string, preserveDefaultPaths: bool
     throw new Error(`${location}.activeSetId 必须是字符串或 null。`);
   }
   const activeSetId = candidate.activeSetId as string | null;
+  if (activeSetId !== null && !sets.some((skillSet) => skillSet.id === activeSetId)) {
+    throw new Error(`${location}.activeSetId 必须引用现有技能集。`);
+  }
   if (
     preserveDefaultPaths &&
     candidate.defaultPaths !== undefined &&
@@ -136,14 +139,20 @@ export async function readSkillSetStore(storePath: string): Promise<SkillSetStor
   return { path: storePath, contents, hash: sha256(contents), data: parseSkillSetStore(contents) };
 }
 
-export async function writeSkillSetStoreAtomically(
+export async function assertSkillSetStoreUnchanged(
   snapshot: SkillSetStoreSnapshot,
-  data: SkillSetStore,
 ): Promise<void> {
   const current = await readSkillSetStore(snapshot.path);
   if (current.hash !== snapshot.hash) {
     throw new Error("工具运行期间 codex-skills.json 已被修改。请重新运行后再试。");
   }
+}
+
+export async function writeSkillSetStoreAtomically(
+  snapshot: SkillSetStoreSnapshot,
+  data: SkillSetStore,
+): Promise<void> {
+  await assertSkillSetStoreUnchanged(snapshot);
 
   const contents = `${JSON.stringify(data, null, 2)}\n`;
   // 写入前再次经过解析器，避免将内存中的无效状态落盘。

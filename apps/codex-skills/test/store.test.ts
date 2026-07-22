@@ -4,6 +4,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  assertSkillSetStoreUnchanged,
   emptySkillSetStore,
   parseSkillSetStore,
   readSkillSetStore,
@@ -66,6 +67,20 @@ test("拒绝超过上限或包含重复名称的技能集状态", () => {
   );
 });
 
+test("拒绝 activeSetId 引用不存在的技能集", () => {
+  const base = emptySkillSetStore();
+  assert.throws(
+    () =>
+      parseSkillSetStore(
+        JSON.stringify({
+          ...base,
+          global: { ...base.global, activeSetId: "missing" },
+        }),
+      ),
+    /activeSetId 必须引用现有技能集/,
+  );
+});
+
 test("原子写入技能集状态并拒绝并发覆盖", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "codex-skills-store-"));
   const storePath = path.join(directory, "codex-skills.json");
@@ -83,6 +98,10 @@ test("原子写入技能集状态并拒绝并发覆盖", async () => {
   assert.deepEqual(parseSkillSetStore(await readFile(storePath, "utf8")), data);
 
   await writeFile(storePath, `${JSON.stringify(emptySkillSetStore())}\n`, "utf8");
+  await assert.rejects(
+    assertSkillSetStoreUnchanged(snapshot),
+    /codex-skills\.json 已被修改/,
+  );
   await assert.rejects(
     writeSkillSetStoreAtomically(snapshot, data),
     /codex-skills\.json 已被修改/,
