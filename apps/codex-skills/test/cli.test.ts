@@ -87,3 +87,12 @@ test("--set 要求明确作用域且不能与只读选项组合", async () => {
   assert.equal(conflicting.code, 1);
   assert.match(conflicting.stderr, /--set 不能与 --list 或 --search 一起使用/);
 });
+
+test("帮助只列出命令和选项，不重复交互操作提示", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "codex-skills-cli-help-"));
+  const result = await runCli(home, ["--help"]);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /--set <技能集名称>/);
+  assert.doesNotMatch(result.stdout, /操作：输入以搜索/);
+});

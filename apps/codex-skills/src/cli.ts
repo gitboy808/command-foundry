@@ -39,7 +39,7 @@ import type {
 const VERSION = "0.1.0";
 
 function usage(): string {
-  return `用法：\n  codex-skills [--list] [--search [关键词]]\n  codex-skills --set <技能集名称> --scope <global|project>\n\n管理本地及当前项目的 Codex 技能和技能集。\n\n选项：\n  --list                 只读列出技能及其状态\n  -s, --search [关键词]    预填搜索框；与 --list 配合时过滤输出\n  --set <技能集名称>       非交互式激活技能集\n  --scope <global|project> 指定 --set 的技能集作用域\n  -h, --help             显示帮助\n  -v, --version          显示版本\n\n操作：输入以搜索，方向键移动，Space 切换，Shift+Tab 切换菜单；搜索为空时也可使用左右键切换，搜索有内容时左右键移动光标。Enter 应用，Esc 取消当前操作。`;
+  return `用法：\n  codex-skills [--list] [--search [关键词]]\n  codex-skills --set <技能集名称> --scope <global|project>\n\n管理本地及当前项目的 Codex 技能和技能集。\n\n选项：\n  --list                 只读列出技能及其状态\n  -s, --search [关键词]    预填搜索框；与 --list 配合时过滤输出\n  --set <技能集名称>       非交互式激活技能集\n  --scope <global|project> 指定 --set 的技能集作用域\n  -h, --help             显示帮助\n  -v, --version          显示版本`;
 }
 
 interface CliOptions {
