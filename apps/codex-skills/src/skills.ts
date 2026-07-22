@@ -2,6 +2,7 @@ import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parse } from "yaml";
+import { findProjectContext } from "./project.js";
 import type { Skill, SkillSource } from "./types.js";
 
 interface FrontMatter {
@@ -65,16 +66,15 @@ export function searchSkills(skills: readonly Skill[], query: string): Skill[] {
 
 async function projectSkillRoots(cwd: string): Promise<string[]> {
   const start = path.resolve(cwd);
+  const project = await findProjectContext(start);
+  if (!project) return [path.join(start, ".agents", "skills")];
+
   const directories = [start];
   let current = start;
 
   while (true) {
-    try {
-      // `.git` 可能是目录，也可能是 worktree 中的指针文件。
-      await stat(path.join(current, ".git"));
+    if (current === project.directory) {
       return directories.map((directory) => path.join(directory, ".agents", "skills"));
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
 
     const parent = path.dirname(current);
