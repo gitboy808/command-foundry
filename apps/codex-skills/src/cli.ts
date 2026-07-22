@@ -2,7 +2,7 @@
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Key } from "node:readline";
-import { readConfig, updateSkillStates, writeConfigAtomically } from "./config.js";
+import { readConfig, updateSkillStates } from "./config.js";
 import { managerPrompt, type ManagerAction, type ManagerView } from "./manager-prompt.js";
 import { findProjectContext } from "./project.js";
 import { searchableCheckbox } from "./search-checkbox.js";
@@ -22,10 +22,8 @@ import {
 } from "./skill-sets.js";
 import { discoverSkills, searchSkills } from "./skills.js";
 import { confirmPrompt, textInput } from "./simple-prompts.js";
-import {
-  readSkillSetStore,
-  writeSkillSetStoreAtomically,
-} from "./store.js";
+import { writeStateChanges } from "./state-writer.js";
+import { readSkillSetStore, writeSkillSetStoreAtomically } from "./store.js";
 import type {
   ConfigSnapshot,
   ProjectContext,
@@ -41,12 +39,14 @@ import type {
 const VERSION = "0.1.0";
 
 function usage(): string {
-  return `用法：codex-skills [--list] [--search [关键词]]\n\n交互式管理本地及当前项目的 Codex 技能和技能集。\n\n选项：\n  --list              只读列出技能及其状态\n  -s, --search [关键词] 预填搜索框；与 --list 配合时过滤输出\n  -h, --help          显示帮助\n  -v, --version       显示版本\n\n操作：输入以搜索，方向键移动，Space 切换，Shift+Tab 切换菜单；搜索为空时也可使用左右键切换，搜索有内容时左右键移动光标。Enter 应用，Esc 取消当前操作。`;
+  return `用法：\n  codex-skills [--list] [--search [关键词]]\n  codex-skills --set <技能集名称> --scope <global|project>\n\n管理本地及当前项目的 Codex 技能和技能集。\n\n选项：\n  --list                 只读列出技能及其状态\n  -s, --search [关键词]    预填搜索框；与 --list 配合时过滤输出\n  --set <技能集名称>       非交互式激活技能集\n  --scope <global|project> 指定 --set 的技能集作用域\n  -h, --help             显示帮助\n  -v, --version          显示版本\n\n操作：输入以搜索，方向键移动，Space 切换，Shift+Tab 切换菜单；搜索为空时也可使用左右键切换，搜索有内容时左右键移动光标。Enter 应用，Esc 取消当前操作。`;
 }
 
 interface CliOptions {
   list: boolean;
   search?: string | true;
+  set?: string;
+  scope?: SkillSetScope;
 }
 
 function parseArgs(args: string[]): CliOptions {
@@ -76,7 +76,31 @@ function parseArgs(args: string[]): CliOptions {
       }
       continue;
     }
+    if (argument === "--set") {
+      const name = args[index + 1];
+      if (name === undefined || name.startsWith("-")) {
+        throw new Error("--set 必须提供技能集名称。");
+      }
+      options.set = name;
+      index++;
+      continue;
+    }
+    if (argument === "--scope") {
+      const scope = args[index + 1];
+      if (scope !== "global" && scope !== "project") {
+        throw new Error("--scope 必须是 global 或 project。");
+      }
+      options.scope = scope;
+      index++;
+      continue;
+    }
     throw new Error(`未知选项：${argument}`);
+  }
+  if ((options.set === undefined) !== (options.scope === undefined)) {
+    throw new Error("--set 和 --scope 必须一起使用。");
+  }
+  if (options.set !== undefined && (options.list || options.search !== undefined)) {
+    throw new Error("--set 不能与 --list 或 --search 一起使用。");
   }
   return options;
 }
@@ -261,8 +285,10 @@ async function applyManualSelection(
     console.log("没有需要应用的变更。");
     return;
   }
-  if (configChanged) await writeConfigAtomically(config, updatedConfig);
-  if (storeChanged) await writeSkillSetStoreAtomically(storeSnapshot, nextStore);
+  await writeStateChanges(
+    configChanged ? { snapshot: config, contents: updatedConfig } : undefined,
+    storeChanged ? { snapshot: storeSnapshot, data: nextStore } : undefined,
+  );
 
   if (configChanged) {
     console.log(`已将 ${desired.size} 项技能变更写入 ${config.path}。`);
@@ -279,6 +305,7 @@ async function activateSkillSet(
   skills: readonly Skill[],
   scope: SkillSetScope,
   setId: string | null,
+  requireConfirmation = true,
 ): Promise<void> {
   const group = groupForScope(storeSnapshot.data, scope, project);
   const scopedSkills = skillsInScope(skills, scope);
@@ -300,22 +327,23 @@ async function activateSkillSet(
   const available = new Set(scopedSkills.map((skill) => skill.path));
   const missing = targetPaths.filter((skillPath) => !available.has(skillPath)).length;
   const targetName = skillSet?.name ?? "默认";
-  const confirmed = await withEscapeCancellation((signal) =>
-    confirmPrompt(
-      {
-        message: `激活“${targetName}”：启用 ${enabled}，禁用 ${disabled}，无变化 ${unchanged}，缺失 ${missing}。确认应用？`,
-        default: true,
-      },
-      { signal },
-    ),
-  );
+  const confirmed = requireConfirmation
+    ? await withEscapeCancellation((signal) =>
+        confirmPrompt(
+          {
+            message: `激活“${targetName}”：启用 ${enabled}，禁用 ${disabled}，无变化 ${unchanged}，缺失 ${missing}。确认应用？`,
+            default: true,
+          },
+          { signal },
+        ),
+      )
+    : true;
   if (!confirmed) {
     console.log("已取消，未应用任何变更。");
     return;
   }
 
   const updatedConfig = updateSkillStates(config.contents, desired);
-  if (updatedConfig !== config.contents) await writeConfigAtomically(config, updatedConfig);
   const nextStore = setGroupInStore(
     storeSnapshot.data,
     scope,
@@ -326,10 +354,14 @@ async function activateSkillSet(
       defaultPaths: group.defaultPaths ?? scopedSkills.map((skill) => skill.path),
     },
   );
-  await writeSkillSetStoreAtomically(storeSnapshot, nextStore);
+  const configChanged = updatedConfig !== config.contents;
+  await writeStateChanges(
+    configChanged ? { snapshot: config, contents: updatedConfig } : undefined,
+    { snapshot: storeSnapshot, data: nextStore },
+  );
 
   console.log(`已激活${scope === "global" ? "全局" : "项目"}技能集“${targetName}”。`);
-  if (updatedConfig !== config.contents) {
+  if (configChanged) {
     console.log("请重启 Codex 或新建任务，使新的技能状态生效。");
   }
 }
@@ -344,6 +376,7 @@ async function main(): Promise<void> {
   const skills = await discoverSkills(config.enabledByPath, home);
 
   if (skills.length === 0) {
+    if (options.set !== undefined) throw new Error("未发现可由技能集管理的技能。");
     console.log("在本地技能目录及当前项目的 .agents/skills 中未发现技能。");
     return;
   }
@@ -365,6 +398,25 @@ async function main(): Promise<void> {
 
   const project = await findProjectContext();
   let storeSnapshot = await readSkillSetStore(path.join(home, ".codex", "codex-skills.json"));
+  if (options.set !== undefined && options.scope !== undefined) {
+    const group = groupForScope(storeSnapshot.data, options.scope, project);
+    const skillSet = group.sets.find((candidate) => candidate.name === options.set);
+    if (!skillSet) {
+      throw new Error(
+        `${options.scope === "global" ? "全局" : "项目"}作用域中不存在技能集“${options.set}”。`,
+      );
+    }
+    await activateSkillSet(
+      config,
+      storeSnapshot,
+      project,
+      skills,
+      options.scope,
+      skillSet.id,
+      false,
+    );
+    return;
+  }
   let workingSkills = skills;
   let initialView: ManagerView = "skills";
 
@@ -432,13 +484,7 @@ async function main(): Promise<void> {
           action.scope,
           new Set(skillSet.paths),
         );
-        let nextGroup = updateSkillSet(group, skillSet.id, { paths: members });
-        if (group.activeSetId === skillSet.id) {
-          nextGroup = updateDefaultPaths(
-            nextGroup,
-            selectedPathsInScope(workingSkills, action.scope, new Set(action.selectedPaths)),
-          );
-        }
+        const nextGroup = updateSkillSet(group, skillSet.id, { paths: members });
         const nextStore = setGroupInStore(storeSnapshot.data, action.scope, project, nextGroup);
         storeSnapshot = await saveStore(storeSnapshot, nextStore);
         console.log(`已更新技能集“${skillSet.name}”，尚未激活。`);
@@ -456,14 +502,7 @@ async function main(): Promise<void> {
           ),
         );
         if (confirmed) {
-          const baseGroup =
-            group.activeSetId === skillSet.id
-              ? updateDefaultPaths(
-                  group,
-                  selectedPathsInScope(workingSkills, action.scope, new Set(action.selectedPaths)),
-                )
-              : group;
-          const nextGroup = deleteSkillSet(baseGroup, skillSet.id);
+          const nextGroup = deleteSkillSet(group, skillSet.id);
           const nextStore = setGroupInStore(storeSnapshot.data, action.scope, project, nextGroup);
           storeSnapshot = await saveStore(storeSnapshot, nextStore);
           console.log(`已删除技能集“${skillSet.name}”，技能状态未改变。`);

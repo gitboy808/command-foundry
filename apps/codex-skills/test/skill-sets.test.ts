@@ -8,6 +8,7 @@ import {
   captureDefaultPaths,
   createSkillSet,
   defaultPathsForGroup,
+  deleteSkillSet,
   desiredStatesForDefault,
   desiredStatesForSet,
   effectiveActiveSetId,
@@ -83,14 +84,20 @@ test("当前状态不匹配默认或具名集合时不显示活动项", () => {
   assert.equal(effectiveActiveSetId(disabled, "global", group), undefined);
 });
 
-test("编辑活动集合成员后清除活动标记，重命名时保留", () => {
+test("编辑或删除活动集合时清除活动标记并保留默认快照", () => {
   const group = {
     sets: [{ id: "active", name: "旧名称", paths: ["/old"] }],
     activeSetId: "active",
-    defaultPaths: null,
+    defaultPaths: ["/default"],
   };
   assert.equal(updateSkillSet(group, "active", { name: "新名称" }).activeSetId, "active");
-  assert.equal(updateSkillSet(group, "active", { paths: ["/new"] }).activeSetId, null);
+  const updated = updateSkillSet(group, "active", { paths: ["/new"] });
+  assert.equal(updated.activeSetId, null);
+  assert.deepEqual(updated.defaultPaths, ["/default"]);
+
+  const deleted = deleteSkillSet(group, "active");
+  assert.equal(deleted.activeSetId, null);
+  assert.deepEqual(deleted.defaultPaths, ["/default"]);
 });
 
 test("默认技能选择初始全开启并可恢复后续自定义状态", () => {

@@ -75,7 +75,14 @@ codex-skills --list
 # 使用预填关键词打开搜索框；可与 --list 组合过滤输出
 codex-skills --search img
 codex-skills --list --search project
+
+# 非交互式激活全局或当前项目的具名技能集
+codex-skills --set "基础开发" --scope global
+codex-skills --set "项目维护" --scope project
 ```
+
+`--set` 按名称精确匹配技能集并直接应用，不显示确认提示，因此必须同时使用
+`--scope global` 或 `--scope project` 明确作用域。项目作用域要求当前目录位于 Git 仓库中。
 
 ## 开发
 
