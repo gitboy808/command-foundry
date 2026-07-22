@@ -1,4 +1,4 @@
-export type SkillSource = "system" | "user";
+export type SkillSource = "system" | "user" | "project";
 
 export interface Skill {
   path: string;

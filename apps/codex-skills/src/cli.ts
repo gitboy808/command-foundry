@@ -1,20 +1,28 @@
 #!/usr/bin/env node
-import { checkbox } from "@inquirer/prompts";
 import { homedir } from "node:os";
 import path from "node:path";
+import type { Key } from "node:readline";
 import { readConfig, updateSkillStates, writeConfigAtomically } from "./config.js";
-import { discoverSkills } from "./skills.js";
+import { searchableCheckbox } from "./search-checkbox.js";
+import { discoverSkills, searchSkills } from "./skills.js";
+import type { SkillSource } from "./types.js";
 
 const VERSION = "0.1.0";
 
 function usage(): string {
-  return `用法：codex-skills [--list]\n\n交互式启用或禁用本地 Codex 技能。\n\n选项：\n  --list        只读列出技能及其状态\n  -h, --help    显示帮助\n  -v, --version 显示版本\n\n操作：方向键移动，Space 切换，Enter 应用，Esc 取消。`;
+  return `用法：codex-skills [--list] [--search [关键词]]\n\n交互式启用或禁用本地及当前项目的 Codex 技能。\n\n选项：\n  --list              只读列出技能及其状态\n  -s, --search [关键词] 预填搜索框；与 --list 配合时过滤输出\n  -h, --help          显示帮助\n  -v, --version       显示版本\n\n操作：输入以搜索，方向键移动，Space 切换，Enter 应用，Esc 取消。`;
 }
 
-function parseArgs(args: string[]): boolean {
-  let list = false;
+interface CliOptions {
+  list: boolean;
+  search?: string | true;
+}
 
-  for (const argument of args) {
+function parseArgs(args: string[]): CliOptions {
+  const options: CliOptions = { list: false };
+
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
     if (argument === "--help" || argument === "-h") {
       console.log(usage());
       process.exit(0);
@@ -24,63 +32,103 @@ function parseArgs(args: string[]): boolean {
       process.exit(0);
     }
     if (argument === "--list") {
-      list = true;
+      options.list = true;
+      continue;
+    }
+    if (argument === "--search" || argument === "-s") {
+      const query = args[index + 1];
+      if (query !== undefined && !query.startsWith("-")) {
+        options.search = query;
+        index++;
+      } else {
+        options.search = true;
+      }
       continue;
     }
     throw new Error(`未知选项：${argument}`);
   }
-  return list;
+  return options;
 }
 
-function formatChoice(skill: { name: string; source: string; description: string }): string {
+function sourceLabel(source: SkillSource): string {
+  if (source === "system") return "系统";
+  if (source === "project") return "项目";
+  return "用户";
+}
+
+function formatChoice(skill: { name: string; source: SkillSource; description: string }): string {
   const description = skill.description.replace(/\s+/g, " ").trim();
   const suffix = description.length > 72 ? `${description.slice(0, 69)}...` : description;
-  const source = skill.source === "system" ? "系统" : "用户";
-  return `${skill.name}  [${source}]  ${suffix}`;
+  return `${skill.name}  [${sourceLabel(skill.source)}]  ${suffix}`;
+}
+
+async function withEscapeCancellation<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const cancelOnEscape = (_input: string, key: Key): void => {
+    if (key.name === "escape") controller.abort();
+  };
+  // Inquirer prompt 不处理 Esc，统一接入其原生 AbortSignal 取消通道。
+  process.stdin.on("keypress", cancelOnEscape);
+  try {
+    return await run(controller.signal);
+  } finally {
+    process.stdin.removeListener("keypress", cancelOnEscape);
+  }
 }
 
 async function main(): Promise<void> {
-  const list = parseArgs(process.argv.slice(2));
+  const options = parseArgs(process.argv.slice(2));
+  if (options.list && options.search === true) {
+    throw new Error("--list 与 --search 一起使用时必须提供搜索关键词。");
+  }
   const home = homedir();
   const config = await readConfig(path.join(home, ".codex", "config.toml"));
   const skills = await discoverSkills(config.enabledByPath, home);
 
   if (skills.length === 0) {
-    console.log("在 ~/.codex/skills 和 ~/.agents/skills 中未发现技能。");
+    console.log("在本地技能目录及当前项目的 .agents/skills 中未发现技能。");
     return;
   }
 
-  if (list) {
-    for (const skill of skills) {
-      const source = skill.source === "system" ? "系统" : "用户";
-      console.log(`${skill.enabled ? "[x]" : "[ ]"} ${skill.name}\t${source}\t${skill.path}`);
+  if (options.list) {
+    const query = typeof options.search === "string" ? options.search : "";
+    const visibleSkills = searchSkills(skills, query);
+    if (visibleSkills.length === 0) {
+      console.log(`未找到匹配 ${JSON.stringify(query)} 的技能。`);
+      return;
+    }
+    for (const skill of visibleSkills) {
+      console.log(
+        `${skill.enabled ? "[x]" : "[ ]"} ${skill.name}\t${sourceLabel(skill.source)}\t${skill.path}`,
+      );
     }
     return;
   }
 
-  const selected = await checkbox({
-    message: "Codex 技能（Space 切换，Enter 应用，Esc 取消）",
-    choices: skills.map((skill) => ({
-      name: formatChoice(skill),
-      value: skill.path,
-      checked: skill.enabled,
-    })),
-    pageSize: Math.min(skills.length, 14),
-    loop: false,
-    theme: {
-      icon: {
-        checked: "[x]",
-        unchecked: "[ ]",
-        cursor: ">",
+  const selected = await withEscapeCancellation((signal) =>
+    searchableCheckbox(
+      {
+        message: "Codex 技能（Space 切换，Enter 应用，Esc 取消）",
+        skills,
+        renderSkill: formatChoice,
+        initialQuery: typeof options.search === "string" ? options.search : "",
+        pageSize: Math.min(skills.length, 14),
+        loop: false,
       },
-    },
-  });
+      { signal },
+    ),
+  );
   const selectedPaths = new Set(selected);
   const desired = new Map<string, boolean>();
-  // Inquirer 返回所有勾选项；这里只提交状态真正发生变化的技能。
+  // 启用状态是默认值；已有 enabled=true 覆盖项也在提交时顺便清理。
   for (const skill of skills) {
     const nextState = selectedPaths.has(skill.path);
-    if (nextState !== skill.enabled) desired.set(skill.path, nextState);
+    if (
+      nextState !== skill.enabled ||
+      (nextState && config.enabledByPath.has(skill.path))
+    ) {
+      desired.set(skill.path, nextState);
+    }
   }
 
   if (desired.size === 0) {

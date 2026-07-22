@@ -5,9 +5,14 @@
 - `~/.codex/skills/.system`
 - `~/.codex/skills`
 - `~/.agents/skills`
+- 从当前工作目录到 Git 仓库根目录之间每一级的 `.agents/skills`
+
+项目根目录默认通过 `.git` 文件或目录识别；如果当前目录不在 Git 仓库中，
+则只扫描当前目录下的 `.agents/skills`。项目技能会在界面中标记为“项目”。
 
 工具只更新 `~/.codex/config.toml` 中匹配的 `[[skills.config]]` 配置项，
-不会修改或删除技能文件。
+不会修改或删除技能文件。禁用技能时写入覆盖项；重新启用时删除整个覆盖项，
+使用 Codex 的默认启用状态并避免配置持续膨胀。
 
 ## 安装
 
@@ -27,6 +32,8 @@ codex-skills
 
 使用方向键移动光标，按 `Space` 切换技能状态，按 `Enter` 应用修改。
 按 `Esc` 或 `Ctrl+C` 退出时不会写入配置。
+选择器会在技能列表上方显示搜索框，直接输入即可按名称模糊搜索，
+或按描述和路径筛选技能；清空搜索内容可恢复完整列表。
 
 修改技能状态后，需要重启 Codex 或新建任务才能生效。
 
@@ -38,6 +45,10 @@ codex-skills
 
 # 只读显示当前生效状态，不写入任何内容
 codex-skills --list
+
+# 使用预填关键词打开搜索框；可与 --list 组合过滤输出
+codex-skills --search img
+codex-skills --list --search project
 ```
 
 ## 开发
