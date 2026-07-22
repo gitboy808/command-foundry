@@ -22,9 +22,18 @@ export function formatStep(step: ActionStep): string {
   return [step.program, ...step.args].map(quote).join(" ");
 }
 
-async function commandAvailable(runner: CommandRunner, program: string, env: NodeJS.ProcessEnv): Promise<boolean> {
-  const result = await runner.run(program, ["--version"], { env, timeoutMs: 5_000, maxOutputBytes: 8_192 });
-  return result.code === 0;
+async function commandAvailable(
+  runner: CommandRunner,
+  program: string,
+  env: NodeJS.ProcessEnv,
+  args: string[] = ["--version"],
+): Promise<Pick<SourceAvailability, "available" | "reason">> {
+  const result = await runner.run(program, args, { env, timeoutMs: 5_000, maxOutputBytes: 8_192 });
+  if (result.code === 0 && !result.timedOut) return { available: true };
+  // 探测结果会直接展示给用户，保留超时和启动错误以避免误报“未安装”。
+  if (result.timedOut) return { available: false, reason: `${program} 响应超时` };
+  if (result.error) return { available: false, reason: `${program} 不可用：${result.error}` };
+  return { available: false, reason: `${program} 不可用（退出码 ${result.code ?? "未知"}）` };
 }
 
 export async function sourceAvailability(
@@ -38,15 +47,16 @@ export async function sourceAvailability(
     if (platform === "win32") {
       sources.push({ source: "official", available: Boolean(tool.official.windowsUrl), reason: tool.official.windowsUrl ? undefined : "官方未提供 Windows 安装脚本" });
     } else {
-      const available = await commandAvailable(runner, tool.official.installShell, env);
-      sources.push({ source: "official", available, reason: available ? undefined : `缺少 ${tool.official.installShell}` });
+      const availability = await commandAvailable(runner, tool.official.installShell, env, ["-c", "exit 0"]);
+      sources.push({ source: "official", ...availability });
     }
   }
-  const npmAvailable = await commandAvailable(runner, "npm", env);
-  sources.push({ source: "npm", available: npmAvailable, reason: npmAvailable ? undefined : "缺少 npm" });
+  sources.push({ source: "npm", ...await commandAvailable(runner, "npm", env) });
   if (tool.homebrew) {
-    const brewAvailable = platform !== "win32" && await commandAvailable(runner, "brew", { ...env, HOMEBREW_NO_AUTO_UPDATE: "1" });
-    sources.push({ source: "homebrew", available: brewAvailable, reason: brewAvailable ? undefined : platform === "win32" ? "Windows 不支持 Homebrew" : "缺少 Homebrew" });
+    const availability = platform === "win32"
+      ? { available: false, reason: "Windows 不支持 Homebrew" }
+      : await commandAvailable(runner, "brew", { ...env, HOMEBREW_NO_AUTO_UPDATE: "1" });
+    sources.push({ source: "homebrew", ...availability });
   }
   return sources;
 }
@@ -154,7 +164,7 @@ async function executeStep(step: ActionStep, runner: CommandRunner): Promise<{ o
       onStdout: (chunk) => process.stdout.write(chunk),
       onStderr: (chunk) => process.stderr.write(chunk),
     });
-    return { ok: result.code === 0, message: result.error ?? (result.timedOut ? "命令执行超时。" : result.code === 0 ? undefined : `命令退出码：${result.code}`) };
+    return { ok: !result.timedOut && result.code === 0, message: result.error ?? (result.timedOut ? "命令执行超时。" : result.code === 0 ? undefined : `命令退出码：${result.code}`) };
   }
 
   const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-"));
@@ -172,7 +182,7 @@ async function executeStep(step: ActionStep, runner: CommandRunner): Promise<{ o
       onStdout: (chunk) => process.stdout.write(chunk),
       onStderr: (chunk) => process.stderr.write(chunk),
     });
-    return { ok: result.code === 0, message: result.error ?? (result.timedOut ? "官方安装脚本执行超时。" : result.code === 0 ? undefined : `安装脚本退出码：${result.code}`) };
+    return { ok: !result.timedOut && result.code === 0, message: result.error ?? (result.timedOut ? "官方安装脚本执行超时。" : result.code === 0 ? undefined : `安装脚本退出码：${result.code}`) };
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
