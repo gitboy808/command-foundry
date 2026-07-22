@@ -7,6 +7,14 @@ export interface SelectedAction {
   operation: "install" | "update";
 }
 
+export function statusAction(status: ToolStatus): SelectedAction["operation"] | undefined {
+  if (status.state === "not_installed") return "install";
+  if (status.state === "update_available") return "update";
+  // Kimi 官方安装器会迁移旧命令，因此未知状态可以进入显式重装流程。
+  if (status.tool.id === "kimi" && (status.state === "source_unknown" || status.state === "version_unknown")) return "install";
+  return undefined;
+}
+
 export function sourceLabel(source: Source): string {
   if (source === "official") return "官方";
   if (source === "npm") return "npm";
@@ -21,8 +29,8 @@ export function formatStatus(status: ToolStatus): string {
   if (status.state === "update_available") return `${status.tool.label.padEnd(12)} ${current} -> ${status.latest[status.active!.source]} [${source}] 更新`;
   if (status.state === "installed_current") return `${status.tool.label.padEnd(12)} ${current} [${source}] 已是最新`;
   if (status.state === "latest_unavailable") return `${status.tool.label.padEnd(12)} ${current} [${source}] 无法检查最新版`;
-  if (status.state === "version_unknown") return `${status.tool.label.padEnd(12)} [${source}] 无法读取版本`;
-  if (status.state === "source_unknown") return `${status.tool.label.padEnd(12)} ${current} 来源不明或需要迁移`;
+  if (status.state === "version_unknown") return `${status.tool.label.padEnd(12)} [${source}] 无法读取版本${statusAction(status) === "install" ? "，可重新安装" : ""}`;
+  if (status.state === "source_unknown") return `${status.tool.label.padEnd(12)} ${current} 来源不明或需要迁移${statusAction(status) === "install" ? "，可重新安装" : ""}`;
   if (status.state === "multiple_installations") return `${status.tool.label.padEnd(12)} 检测到多个安装来源`;
   return `${status.tool.label.padEnd(12)} ${status.state}`;
 }
@@ -31,13 +39,12 @@ export async function chooseActions(statuses: ToolStatus[]): Promise<SelectedAct
   return checkbox<SelectedAction>({
     message: "AI CLI（Space 选择，Enter 继续，Esc 取消）",
     choices: statuses.map((status) => {
-      const operation = status.state === "not_installed" ? "install" : "update";
-      const actionable = status.state === "not_installed" || status.state === "update_available";
+      const operation = statusAction(status);
       return {
         name: formatStatus(status),
-        value: { toolId: status.tool.id, operation },
+        value: { toolId: status.tool.id, operation: operation ?? "update" },
         checked: false,
-        disabled: actionable ? false : "不可操作",
+        disabled: operation ? false : "不可操作",
       };
     }),
     pageSize: Math.min(statuses.length, 12),
