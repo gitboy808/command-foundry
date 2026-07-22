@@ -25,6 +25,9 @@ pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# 本地代理技能配置
+.agents/
+
 # 本地环境和临时文件
 .env
 .env.*
