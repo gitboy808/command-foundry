@@ -7,11 +7,7 @@ export type ToolState =
   | "update_available"
   | "latest_unavailable"
   | "version_unknown"
-  | "source_unknown"
-  | "multiple_installations"
-  | "broken"
-  | "manager_unavailable"
-  | "unsupported_platform";
+  | "source_unknown";
 
 export interface OfficialDefinition {
   unixUrl: string;
@@ -38,9 +34,9 @@ export interface ToolDefinition {
   npmInstallArgs?: string[];
   legacyNpmPackages?: string[];
   legacyHomebrewPackages?: string[];
-  homebrew?: HomebrewDefinition;
+  homebrew: HomebrewDefinition;
   homebrewAlternatives?: HomebrewDefinition[];
-  official?: OfficialDefinition;
+  official: OfficialDefinition;
 }
 
 export interface Installation {
@@ -91,7 +87,6 @@ export interface CommandStep {
   program: string;
   args: string[];
   env?: NodeJS.ProcessEnv;
-  label: string;
 }
 
 export interface ScriptStep {
@@ -99,21 +94,13 @@ export interface ScriptStep {
   url: string;
   allowedHosts: string[];
   shell: "bash" | "sh" | "powershell";
-  shellArgs?: string[];
-  env?: NodeJS.ProcessEnv;
-  label: string;
 }
 
 export type ActionStep = CommandStep | ScriptStep;
 
 export interface Plan {
-  tool: ToolId;
   label: string;
-  operation: "install" | "update";
-  source: Source;
-  currentVersion?: string;
-  latestVersion?: string;
-  steps: ActionStep[];
+  step: ActionStep;
   summary: string;
 }
 

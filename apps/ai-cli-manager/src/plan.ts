@@ -43,26 +43,21 @@ export async function sourceAvailability(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<SourceAvailability[]> {
   const sources: SourceAvailability[] = [];
-  if (tool.official) {
-    if (platform === "win32") {
-      sources.push({ source: "official", available: Boolean(tool.official.windowsUrl), reason: tool.official.windowsUrl ? undefined : "官方未提供 Windows 安装脚本" });
-    } else {
-      const availability = await commandAvailable(runner, tool.official.installShell, env, ["-c", "exit 0"]);
-      sources.push({ source: "official", ...availability });
-    }
+  if (platform === "win32") {
+    sources.push({ source: "official", available: Boolean(tool.official.windowsUrl), reason: tool.official.windowsUrl ? undefined : "官方未提供 Windows 安装脚本" });
+  } else {
+    const availability = await commandAvailable(runner, tool.official.installShell, env, ["-c", "exit 0"]);
+    sources.push({ source: "official", ...availability });
   }
   sources.push({ source: "npm", ...await commandAvailable(runner, "npm", env) });
-  if (tool.homebrew) {
-    const availability = platform === "win32"
-      ? { available: false, reason: "Windows 不支持 Homebrew" }
-      : await commandAvailable(runner, "brew", { ...env, HOMEBREW_NO_AUTO_UPDATE: "1" });
-    sources.push({ source: "homebrew", ...availability });
-  }
+  const availability = platform === "win32"
+    ? { available: false, reason: "Windows 不支持 Homebrew" }
+    : await commandAvailable(runner, "brew", { ...env, HOMEBREW_NO_AUTO_UPDATE: "1" });
+  sources.push({ source: "homebrew", ...availability });
   return sources;
 }
 
 function officialScriptStep(tool: ToolDefinition, platform: NodeJS.Platform): ActionStep {
-  if (!tool.official) throw new Error(`${tool.label} 没有官方安装源。`);
   const windows = platform === "win32";
   const url = windows ? tool.official.windowsUrl : tool.official.unixUrl;
   if (!url) throw new Error(`${tool.label} 不支持当前平台的官方安装源。`);
@@ -71,7 +66,6 @@ function officialScriptStep(tool: ToolDefinition, platform: NodeJS.Platform): Ac
     url,
     allowedHosts: tool.official.scriptHosts,
     shell: windows ? "powershell" : tool.official.installShell,
-    label: `${tool.label} 官方安装器`,
   };
 }
 
@@ -84,60 +78,41 @@ export function createPlan(
   if (source === "unknown") throw new Error(`无法为 ${status.tool.label} 的未知来源生成操作。`);
   if (operation === "update" && status.active?.legacy) throw new Error(`${status.tool.label} 当前为旧版安装，需要手动迁移来源。`);
   const tool = status.tool;
-  const steps: ActionStep[] = [];
+  let step: ActionStep;
   if (source === "official") {
-    if (operation === "update" && tool.official?.update === "command") {
-      steps.push({
+    if (operation === "update" && tool.official.update === "command") {
+      step = {
         kind: "command",
         program: status.active?.path ?? tool.command,
         args: tool.official.updateArgs ?? ["update"],
-        label: `${tool.label} 官方更新`,
-      });
+      };
     } else {
-      steps.push(officialScriptStep(tool, platform));
+      step = officialScriptStep(tool, platform);
     }
   } else if (source === "npm") {
-    steps.push({
+    step = {
       kind: "command",
       program: "npm",
       args: ["install", "-g", ...(tool.npmInstallArgs ?? []), `${tool.npmPackage}@latest`],
-      label: `${tool.label} npm ${operation === "install" ? "安装" : "更新"}`,
-    });
-  } else if (source === "homebrew") {
-    if (!tool.homebrew) throw new Error(`${tool.label} 没有 Homebrew 来源。`);
+    };
+  } else {
     const installedName = operation === "update" && status.active?.source === "homebrew" ? status.active.packageName : undefined;
     const brewDefinition = [tool.homebrew, ...(tool.homebrewAlternatives ?? [])].find((definition) => definition.name === installedName) ?? tool.homebrew;
-    steps.push({
+    step = {
       kind: "command",
       program: "brew",
       args: [operation === "install" ? "install" : "upgrade", ...(brewDefinition.kind === "cask" ? ["--cask"] : []), brewDefinition.name],
       env: { HOMEBREW_NO_AUTO_UPDATE: "1" },
-      label: `${tool.label} Homebrew ${operation === "install" ? "安装" : "更新"}`,
-    });
+    };
   }
   const current = status.active?.version;
   const latest = status.latest[source];
   const versionText = operation === "update" && current ? `${current}${latest ? ` -> ${latest}` : ""}` : latest ?? "latest";
   return {
-    tool: tool.id,
     label: tool.label,
-    operation,
-    source,
-    currentVersion: current,
-    latestVersion: latest,
-    steps,
+    step,
     summary: `${tool.label}：${operation === "install" ? "安装" : "更新"} ${versionText} [${source}]`,
   };
-}
-
-export function createInstalledUpdatePlans(statuses: ToolStatus[]): Plan[] {
-  const plans: Plan[] = [];
-  for (const status of statuses) {
-    const active = status.active;
-    if (!active || active.source === "unknown" || active.legacy) continue;
-    plans.push(createPlan(status, "update", active.source));
-  }
-  return plans;
 }
 
 export function isAllowedScriptUrl(url: string, allowedHosts: readonly string[]): boolean {
@@ -183,10 +158,10 @@ async function executeStep(step: ActionStep, runner: CommandRunner): Promise<{ o
   try {
     await writeFile(scriptPath, await downloadScript(step.url, step.allowedHosts), { encoding: "utf8", mode: 0o700, flag: "wx" });
     const args = step.shell === "powershell"
-      ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...(step.shellArgs ?? [])]
-      : [scriptPath, ...(step.shellArgs ?? [])];
+      ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath]
+      : [scriptPath];
     const result = await runner.run(step.shell, args, {
-      env: { ...process.env, ...step.env },
+      env: process.env,
       timeoutMs: 10 * 60_000,
       maxOutputBytes: 2 * 1024 * 1024,
       onStdout: (chunk) => process.stdout.write(chunk),
@@ -202,22 +177,11 @@ export async function executePlans(plans: Plan[], runner: CommandRunner): Promis
   const results: Array<{ plan: Plan; ok: boolean; message?: string }> = [];
   for (const plan of plans) {
     console.log(`\n==> ${plan.summary}`);
-    let ok = true;
-    let message: string | undefined;
     try {
-      for (const step of plan.steps) {
-        const result = await executeStep(step, runner);
-        if (!result.ok) {
-          ok = false;
-          message = result.message;
-          break;
-        }
-      }
+      results.push({ plan, ...await executeStep(plan.step, runner) });
     } catch (error: unknown) {
-      ok = false;
-      message = (error as Error).message;
+      results.push({ plan, ok: false, message: (error as Error).message });
     }
-    results.push({ plan, ok, message });
   }
   return results;
 }

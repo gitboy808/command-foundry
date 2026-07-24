@@ -1,7 +1,6 @@
 #!/usr/bin/env node
-import { CATALOG } from "./catalog.js";
 import { detectAll } from "./detector.js";
-import { createInstalledUpdatePlans, createPlan, executePlans, sourceAvailability } from "./plan.js";
+import { createPlan, executePlans, sourceAvailability } from "./plan.js";
 import { NodeCommandRunner } from "./runner.js";
 import type { Plan, ToolStatus } from "./types.js";
 import { chooseActions, chooseInstallSource, confirmPlans, formatStatus, printPlans } from "./ui.js";
@@ -87,27 +86,21 @@ async function main(): Promise<void> {
     printStatuses(statuses);
     return;
   }
-  if (options.update) {
-    const plans = createInstalledUpdatePlans(statuses);
-    const plannedTools = new Set(plans.map((plan) => plan.tool));
-    for (const status of statuses) {
-      if (status.active && !plannedTools.has(status.tool.id)) {
-        console.error(`${status.tool.label} 的来源不明确或需要迁移，已跳过。`);
-      }
-    }
-    if (plans.length === 0) {
-      console.log("没有可安全更新的已安装 CLI。");
-      return;
-    }
-    printPlans(plans);
-    await runPlans(plans, runner, !options.offline);
-    return;
-  }
-  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("交互模式需要 TTY；请使用 --list、--json 或 --update。");
+  if (!options.update && (!process.stdin.isTTY || !process.stdout.isTTY)) throw new Error("交互模式需要 TTY；请使用 --list、--json 或 --update。");
 
-  const selected = await chooseActions(statuses);
+  // 批量更新只复用当前来源，避免非交互模式静默迁移安装方式。
+  const selected = options.update
+    ? statuses.flatMap((status) => {
+      if (!status.active) return [];
+      if (status.active.source === "unknown" || status.active.legacy) {
+        console.error(`${status.tool.label} 的来源不明确或需要迁移，已跳过。`);
+        return [];
+      }
+      return [{ toolId: status.tool.id, operation: "update" as const }];
+    })
+    : await chooseActions(statuses);
   if (selected.length === 0) {
-    console.log("没有选择任何操作。");
+    console.log(options.update ? "没有可安全更新的已安装 CLI。" : "没有选择任何操作。");
     return;
   }
 
@@ -130,7 +123,7 @@ async function main(): Promise<void> {
   }
 
   printPlans(plans);
-  if (!(await confirmPlans())) {
+  if (!options.update && !(await confirmPlans())) {
     console.log("已取消，未执行任何操作。");
     return;
   }

@@ -20,7 +20,6 @@ interface PathCandidate {
 }
 
 interface NpmInventory {
-  available: boolean;
   root?: string;
   packages: Map<string, { version?: string; path: string; binPath?: string }>;
   warning?: string;
@@ -81,7 +80,7 @@ async function pathCandidates(command: string, env: NodeJS.ProcessEnv, platform:
 async function readNpmInventory(tool: ToolDefinition, runner: CommandRunner, env: NodeJS.ProcessEnv): Promise<NpmInventory> {
   const rootResult = await runner.run("npm", ["root", "-g"], { env });
   if (rootResult.code !== 0 || !rootResult.stdout.trim()) {
-    return { available: false, packages: new Map(), warning: "npm 不可用或无法读取全局目录。" };
+    return { packages: new Map(), warning: "npm 不可用或无法读取全局目录。" };
   }
   const root = rootResult.stdout.trim().split(/\r?\n/).pop()!.trim();
   const packages = new Map<string, { version?: string; path: string; binPath?: string }>();
@@ -109,11 +108,11 @@ async function readNpmInventory(tool: ToolDefinition, runner: CommandRunner, env
       packages.set(name, { version: typeof manifest.version === "string" ? manifest.version : undefined, path: packagePath, binPath });
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        return { available: true, root, packages, warning: `读取 npm 包 ${name} 失败。` };
+        return { root, packages, warning: `读取 npm 包 ${name} 失败。` };
       }
     }
   }
-  return { available: true, root, packages };
+  return { root, packages };
 }
 
 function parseJsonObject(value: string): Record<string, unknown> | undefined {
@@ -126,7 +125,6 @@ function parseJsonObject(value: string): Record<string, unknown> | undefined {
 }
 
 async function readBrewInventory(tool: ToolDefinition, runner: CommandRunner, env: NodeJS.ProcessEnv): Promise<BrewInventory> {
-  if (!tool.homebrew) return { available: true, packages: new Map() };
   const brewEnv = { ...env, HOMEBREW_NO_AUTO_UPDATE: "1" };
   const basePrefixResult = await runner.run("brew", ["--prefix"], { env: brewEnv, timeoutMs: 5_000 });
   const basePrefix = basePrefixResult.code === 0 ? basePrefixResult.stdout.trim() : undefined;
@@ -198,10 +196,10 @@ async function readLatest(tool: ToolDefinition, source: Source, inventory: NpmIn
       return extractVersion(result.stdout);
     }
   }
-  if (source === "homebrew" && tool.homebrew) {
+  if (source === "homebrew") {
     return (inventory as BrewInventory).packages.get(tool.homebrew.name)?.latest;
   }
-  if (source === "official" && tool.official) {
+  if (source === "official") {
     const fetcher = options.fetchText ?? fetchWithTimeout;
     for (const url of tool.official.latestUrls) {
       try {
@@ -246,11 +244,11 @@ function pathMatchesPrefix(candidate: PathCandidate, prefix: string | undefined,
 }
 
 function officialPathMatches(tool: ToolDefinition, candidate: PathCandidate, home: string): boolean {
-  return Boolean(tool.official?.markers.some((marker) => candidate.realpath.includes(path.join(home, marker)) || candidate.path.includes(path.join(home, marker))));
+  return tool.official.markers.some((marker) => candidate.realpath.includes(path.join(home, marker)) || candidate.path.includes(path.join(home, marker)));
 }
 
 async function officialMarkerExists(tool: ToolDefinition, home: string, platform: NodeJS.Platform): Promise<string | undefined> {
-  for (const marker of tool.official?.markers ?? []) {
+  for (const marker of tool.official.markers) {
     const markerPath = path.join(home, marker);
     if (await executable(markerPath, platform)) return markerPath;
   }
@@ -278,7 +276,7 @@ export async function detectTool(tool: ToolDefinition, options: DetectOptions): 
   const installations: Installation[] = [];
   const warnings: string[] = [];
   const npm = await readNpmInventory(tool, options.runner, env);
-  const brewDefinitions = [tool.homebrew, ...(tool.homebrewAlternatives ?? [])].filter((definition): definition is NonNullable<typeof definition> => Boolean(definition));
+  const brewDefinitions = [tool.homebrew, ...(tool.homebrewAlternatives ?? [])];
   const brewInventories = platform === "win32"
     ? brewDefinitions.map((definition) => ({ definition, inventory: { available: false, packages: new Map<string, { version?: string; latest?: string; prefix?: string }>(), warning: "Windows 不支持 Homebrew 来源。" } as BrewInventory }))
     : await Promise.all(brewDefinitions.map(async (definition) => ({
@@ -381,7 +379,7 @@ export async function detectTool(tool: ToolDefinition, options: DetectOptions): 
   }
   if (npm.warning) warnings.push(npm.warning);
   for (const { inventory } of brewInventories) if (inventory.warning && inventory.available) warnings.push(inventory.warning);
-  if (!brewAvailable && tool.homebrew && platform !== "win32") warnings.push(brewInventories[0]?.inventory.warning ?? "Homebrew 不可用。安装时可选择其他来源。");
+  if (!brewAvailable && platform !== "win32") warnings.push(brewInventories[0]?.inventory.warning ?? "Homebrew 不可用。安装时可选择其他来源。");
 
   const active = installations.find((installation) => installation.active);
   const latest: Partial<Record<Source, string>> = {};

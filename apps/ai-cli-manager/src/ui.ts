@@ -16,10 +16,7 @@ export function statusAction(status: ToolStatus): SelectedAction["operation"] | 
 }
 
 export function sourceLabel(source: Source): string {
-  if (source === "official") return "官方";
-  if (source === "npm") return "npm";
-  if (source === "homebrew") return "Homebrew";
-  return "未知";
+  return { official: "官方", npm: "npm", homebrew: "Homebrew", unknown: "未知" }[source];
 }
 
 export function formatStatus(status: ToolStatus): string {
@@ -31,7 +28,6 @@ export function formatStatus(status: ToolStatus): string {
   if (status.state === "latest_unavailable") return `${status.tool.label.padEnd(12)} ${current} [${source}] 无法检查最新版`;
   if (status.state === "version_unknown") return `${status.tool.label.padEnd(12)} [${source}] 无法读取版本${statusAction(status) === "install" ? "，可重新安装" : ""}`;
   if (status.state === "source_unknown") return `${status.tool.label.padEnd(12)} ${current} 来源不明或需要迁移${statusAction(status) === "install" ? "，可重新安装" : ""}`;
-  if (status.state === "multiple_installations") return `${status.tool.label.padEnd(12)} 检测到多个安装来源`;
   return `${status.tool.label.padEnd(12)} ${status.state}`;
 }
 
@@ -69,7 +65,7 @@ export function printPlans(plans: Plan[]): void {
   console.log("\n将执行以下操作：");
   for (const plan of plans) {
     console.log(`\n${plan.summary}`);
-    for (const step of plan.steps) console.log(`  ${formatStep(step)}`);
+    console.log(`  ${formatStep(plan.step)}`);
   }
 }
 
