@@ -1,5 +1,5 @@
 export function extractVersion(value: string): string | undefined {
-  const match = value.match(/\bv?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\b/);
+  const match = value.match(/\bv?(\d+(?:\.\d+){1,3}(?:-[0-9A-Za-z.-]+)?)(?:\+[0-9A-Za-z.-]+)?\b/);
   return match?.[1];
 }
 
@@ -17,7 +17,7 @@ export function compareVersions(left: string, right: string): number {
   const a = parseVersion(left);
   const b = parseVersion(right);
   if (!a || !b) return 0;
-  for (let index = 0; index < 3; index += 1) {
+  for (let index = 0; index < Math.max(a.numbers.length, b.numbers.length); index += 1) {
     const difference = (a.numbers[index] ?? 0) - (b.numbers[index] ?? 0);
     if (difference !== 0) return difference > 0 ? 1 : -1;
   }
