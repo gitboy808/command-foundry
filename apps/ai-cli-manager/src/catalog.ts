@@ -1,83 +1,79 @@
-import type { ToolDefinition } from "./types.js";
+export type ActionStep =
+  | { readonly kind: "command"; readonly program: string; readonly args: readonly string[] }
+  | { readonly kind: "script"; readonly url: string; readonly allowedHosts: readonly string[]; readonly shell: "bash" | "sh" | "powershell" };
 
-export const CATALOG: ToolDefinition[] = [
+interface RecipeShape {
+  readonly id: string;
+  readonly label: string;
+  readonly command: string;
+  readonly versionArgs: readonly string[];
+  readonly install: { readonly unix: ActionStep; readonly win32?: ActionStep };
+  readonly updateArgs: readonly string[];
+}
+
+const script = (
+  url: string,
+  allowedHosts: string[],
+  shell: "bash" | "sh" | "powershell",
+): ActionStep => ({ kind: "script", url, allowedHosts, shell });
+
+export const CATALOG = [
   {
     id: "claude",
     label: "Claude Code",
     command: "claude",
     versionArgs: ["--version"],
-    npmPackage: "@anthropic-ai/claude-code",
-    homebrew: { name: "claude-code", kind: "cask" },
-    homebrewAlternatives: [{ name: "claude-code@latest", kind: "cask" }],
-    official: {
-      unixUrl: "https://claude.ai/install.sh",
-      windowsUrl: "https://claude.ai/install.ps1",
-      scriptHosts: ["claude.ai", "downloads.claude.ai"],
-      installShell: "bash",
-      update: "command",
-      updateArgs: ["update"],
-      markers: [".local/share/claude"],
-      latestUrls: ["https://downloads.claude.ai/claude-code-releases/latest"],
+    install: {
+      unix: script("https://claude.ai/install.sh", ["claude.ai", "downloads.claude.ai"], "bash"),
+      win32: script("https://claude.ai/install.ps1", ["claude.ai", "downloads.claude.ai"], "powershell"),
     },
+    updateArgs: ["update"],
   },
   {
     id: "codex",
-    label: "Codex CLI",
+    label: "Codex",
     command: "codex",
     versionArgs: ["--version"],
-    npmPackage: "@openai/codex",
-    homebrew: { name: "codex", kind: "cask" },
-    official: {
-      unixUrl: "https://chatgpt.com/codex/install.sh",
-      windowsUrl: "https://chatgpt.com/codex/install.ps1",
-      scriptHosts: ["chatgpt.com", "release-assets.githubusercontent.com"],
-      installShell: "sh",
-      update: "command",
-      updateArgs: ["update"],
-      markers: [".codex/packages/standalone"],
-      latestUrls: ["https://api.github.com/repos/openai/codex/releases/latest"],
+    install: {
+      unix: script("https://chatgpt.com/codex/install.sh", ["chatgpt.com", "releases.openai.com"], "sh"),
+      win32: script("https://chatgpt.com/codex/install.ps1", ["chatgpt.com", "releases.openai.com"], "powershell"),
     },
+    updateArgs: ["update"],
   },
   {
     id: "kimi",
     label: "Kimi Code",
     command: "kimi",
     versionArgs: ["--version"],
-    npmPackage: "@moonshot-ai/kimi-code",
-    legacyNpmPackages: ["kimi-cli"],
-    legacyHomebrewPackages: ["kimi-cli"],
-    homebrew: { name: "kimi-code", kind: "formula" },
-    official: {
-      unixUrl: "https://code.kimi.com/kimi-code/install.sh",
-      windowsUrl: "https://code.kimi.com/kimi-code/install.ps1",
-      scriptHosts: ["code.kimi.com", "cdn.kimi.com"],
-      installShell: "bash",
-      update: "script",
-      markers: [".kimi-code/bin/kimi"],
-      latestUrls: ["https://code.kimi.com/kimi-code/latest"],
+    install: {
+      unix: script("https://code.kimi.com/kimi-code/install.sh", ["code.kimi.com", "cdn.kimi.com"], "bash"),
+      win32: script("https://code.kimi.com/kimi-code/install.ps1", ["code.kimi.com", "cdn.kimi.com"], "powershell"),
     },
+    updateArgs: ["update"],
   },
   {
     id: "pi",
     label: "Pi",
     command: "pi",
     versionArgs: ["--version"],
-    npmPackage: "@earendil-works/pi-coding-agent",
-    legacyNpmPackages: ["@mariozechner/pi-coding-agent"],
-    homebrew: { name: "pi-coding-agent", kind: "formula" },
-    official: {
-      unixUrl: "https://pi.dev/install.sh",
-      scriptHosts: ["pi.dev"],
-      installShell: "sh",
-      update: "command",
-      updateArgs: ["update", "--self"],
-      markers: [],
-      latestUrls: ["https://pi.dev/api/latest-version"],
+    install: {
+      unix: { kind: "command", program: "npm", args: ["install", "-g", "--ignore-scripts", "@earendil-works/pi-coding-agent"] },
+      win32: { kind: "command", program: "npm", args: ["install", "-g", "--ignore-scripts", "@earendil-works/pi-coding-agent"] },
     },
-    npmInstallArgs: ["--ignore-scripts"],
+    updateArgs: ["update", "--self"],
   },
-];
+  {
+    id: "omp",
+    label: "OMP",
+    command: "omp",
+    versionArgs: ["--version"],
+    install: {
+      unix: script("https://omp.sh/install", ["omp.sh", "raw.githubusercontent.com"], "sh"),
+      win32: script("https://omp.sh/install.ps1", ["omp.sh", "raw.githubusercontent.com"], "powershell"),
+    },
+    updateArgs: ["update"],
+  },
+] as const satisfies readonly RecipeShape[];
 
-export function getTool(id: string): ToolDefinition | undefined {
-  return CATALOG.find((tool) => tool.id === id);
-}
+export type ToolId = typeof CATALOG[number]["id"];
+export type ToolRecipe = typeof CATALOG[number];
