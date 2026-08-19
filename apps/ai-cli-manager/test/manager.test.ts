@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
 import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
   createCliManager,
@@ -43,6 +43,8 @@ test("扫描只读取 PATH 当前生效命令的本地版本", async () => {
     { id: "kimi", label: "Kimi Code", state: "installed", version: "0.34.0", action: "update", preview: "kimi update" },
     { id: "pi", label: "Pi", state: "installed", version: "0.84.1", action: "update", preview: "pi update --self" },
     { id: "omp", label: "OMP", state: "missing", action: "install", preview: "下载 https://omp.sh/install，然后使用 sh 执行" },
+    { id: "mmx", label: "MiniMax CLI", state: "missing", action: "install", preview: "npm install -g mmx-cli" },
+    { id: "grok", label: "Grok Build", state: "missing", action: "install", preview: "下载 https://x.ai/cli/install.sh，然后使用 bash 执行" },
   ]);
 });
 
@@ -128,7 +130,7 @@ test("批量动作严格串行执行", async () => {
 test("并发只读扫描不会死锁或遗留信号监听器", { skip: process.platform === "win32" }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-scan-"));
   const source = `#!${process.execPath}\nsetTimeout(() => console.log("1.0.0"), 10);\n`;
-  for (const command of ["claude", "codex", "kimi", "pi", "omp"]) {
+  for (const command of ["claude", "codex", "kimi", "pi", "omp", "mmx", "grok"]) {
     const binary = path.join(directory, command);
     await writeFile(binary, source);
     await chmod(binary, 0o755);
@@ -434,5 +436,141 @@ test("上游退出码为零但动作后版本不可读时报告失败", async ()
     outcome: "failed",
     beforeVersion: "1.0.0",
     message: "动作完成，但无法重新读取版本。",
+  }]);
+});
+
+test("preview 返回任意操作的精确计划，多步骤用 && 连接", () => {
+  const manager = createCliManager({ platform: "linux" });
+  assert.equal(
+    manager.preview({ toolId: "claude", operation: "uninstall" }),
+    "rm -f ~/.local/bin/claude && rm -rf ~/.local/share/claude",
+  );
+  assert.equal(
+    manager.preview({ toolId: "pi", operation: "uninstall" }),
+    "npm uninstall -g @earendil-works/pi-coding-agent",
+  );
+  assert.equal(manager.preview({ toolId: "mmx", operation: "update" }), "mmx update");
+  assert.equal(
+    manager.preview({ toolId: "mmx", operation: "install" }),
+    "npm install -g mmx-cli",
+  );
+  assert.equal(
+    manager.preview({ toolId: "grok", operation: "uninstall" }),
+    "npm uninstall -g @xai-official/grok && rm -f ~/.grok/bin/grok && rm -f ~/.grok/bin/agent && rm -f ~/.local/bin/grok && rm -f ~/.local/bin/agent && rm -rf ~/.grok/downloads",
+  );
+
+  const windowsManager = createCliManager({ platform: "win32" });
+  assert.equal(
+    windowsManager.preview({ toolId: "pi", operation: "uninstall" }),
+    "npm uninstall -g @earendil-works/pi-coding-agent",
+  );
+  assert.throws(
+    () => windowsManager.preview({ toolId: "claude", operation: "uninstall" }),
+    /Claude Code 不支持当前平台的卸载方式。/,
+  );
+  assert.throws(
+    () => windowsManager.preview({ toolId: "grok", operation: "uninstall" }),
+    /Grok Build 不支持当前平台的卸载方式。/,
+  );
+});
+
+test("卸载执行原生步骤并在命令从 PATH 消失后判成功", async () => {
+  const versions: Record<string, string | undefined> = { claude: "2.1.226", mmx: "1.0.19" };
+  const steps: string[] = [];
+  const runner: CommandRunner = {
+    async run(program, args, options) {
+      if (options.stdio === "capture") {
+        const output = versions[program];
+        if (output === undefined) {
+          return { code: null, stdout: "", stderr: "", timedOut: false, errorCode: "ENOENT", error: "ENOENT" };
+        }
+        return { code: 0, stdout: output, stderr: "", timedOut: false };
+      }
+      steps.push([program, ...args].join(" "));
+      if (program === "rm" && args.some((arg) => arg.endsWith(".local/bin/claude"))) versions.claude = undefined;
+      if (program === "npm" && args.includes("mmx-cli")) versions.mmx = undefined;
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    },
+  };
+  const manager = createCliManager({ runner, platform: "linux", env: { PATH: "/test/bin" } });
+
+  assert.deepEqual(await manager.run([
+    { toolId: "claude", operation: "uninstall" },
+    { toolId: "mmx", operation: "uninstall" },
+  ]), [
+    { toolId: "claude", label: "Claude Code", operation: "uninstall", outcome: "changed", beforeVersion: "2.1.226" },
+    { toolId: "mmx", label: "MiniMax CLI", operation: "uninstall", outcome: "changed", beforeVersion: "1.0.19" },
+  ]);
+  const home = homedir();
+  assert.deepEqual(steps, [
+    `rm -f ${path.join(home, ".local/bin/claude")}`,
+    `rm -rf ${path.join(home, ".local/share/claude")}`,
+    "npm uninstall -g mmx-cli",
+  ]);
+});
+
+test("卸载步骤尽力执行，单步启动失败不阻断后续步骤", async () => {
+  let ompVersion: string | undefined = "0.12.4";
+  const steps: string[] = [];
+  const runner: CommandRunner = {
+    async run(program, _args, options) {
+      if (options.stdio === "capture") {
+        if (program === "omp" && ompVersion) return { code: 0, stdout: `omp/${ompVersion}`, stderr: "", timedOut: false };
+        return { code: null, stdout: "", stderr: "", timedOut: false, errorCode: "ENOENT", error: "ENOENT" };
+      }
+      steps.push(program);
+      if (program === "bun") {
+        return { code: null, stdout: "", stderr: "", timedOut: false, error: "spawn bun ENOENT", errorCode: "ENOENT" };
+      }
+      if (program === "rm") ompVersion = undefined;
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    },
+  };
+  const manager = createCliManager({ runner, platform: "linux", env: { PATH: "/test/bin" } });
+
+  assert.deepEqual(await manager.run([{ toolId: "omp", operation: "uninstall" }]), [{
+    toolId: "omp",
+    label: "OMP",
+    operation: "uninstall",
+    outcome: "changed",
+    beforeVersion: "0.12.4",
+  }]);
+  assert.deepEqual(steps, ["bun", "rm"]);
+});
+
+test("卸载命令退出码为零但命令仍在 PATH 中时报告失败", async () => {
+  const runner: CommandRunner = {
+    async run(_program, _args, options) {
+      if (options.stdio === "capture") return { code: 0, stdout: "codex-cli 0.147.0", stderr: "", timedOut: false };
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    },
+  };
+  const manager = createCliManager({ runner, platform: "linux", env: { PATH: "/test/bin" } });
+
+  assert.deepEqual(await manager.run([{ toolId: "codex", operation: "uninstall" }]), [{
+    toolId: "codex",
+    label: "Codex",
+    operation: "uninstall",
+    outcome: "failed",
+    beforeVersion: "0.147.0",
+    afterVersion: "0.147.0",
+    message: "卸载后命令仍在 PATH 中生效，可能由其他方式安装或存在残留副本。",
+  }]);
+});
+
+test("未安装的工具不能卸载", async () => {
+  const runner: CommandRunner = {
+    async run() {
+      return { code: null, stdout: "", stderr: "", timedOut: false, errorCode: "ENOENT", error: "ENOENT" };
+    },
+  };
+  const manager = createCliManager({ runner, platform: "linux", env: { PATH: "/test/bin" } });
+
+  assert.deepEqual(await manager.run([{ toolId: "kimi", operation: "uninstall" }]), [{
+    toolId: "kimi",
+    label: "Kimi Code",
+    operation: "uninstall",
+    outcome: "failed",
+    message: "Kimi Code 未安装。",
   }]);
 });

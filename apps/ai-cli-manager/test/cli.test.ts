@@ -59,6 +59,8 @@ test("status --json 通过真实入口输出纯本地状态", async () => {
       { id: "kimi", label: "Kimi Code", state: "missing", action: "install", preview: "下载 https://code.kimi.com/kimi-code/install.sh，然后使用 bash 执行" },
       { id: "pi", label: "Pi", state: "missing", action: "install", preview: "npm install -g --ignore-scripts @earendil-works/pi-coding-agent" },
       { id: "omp", label: "OMP", state: "missing", action: "install", preview: "下载 https://omp.sh/install，然后使用 sh 执行" },
+      { id: "mmx", label: "MiniMax CLI", state: "missing", action: "install", preview: "npm install -g mmx-cli" },
+      { id: "grok", label: "Grok Build", state: "missing", action: "install", preview: "下载 https://x.ai/cli/install.sh，然后使用 bash 执行" },
     ]);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -70,12 +72,14 @@ test("写操作在非 TTY 环境拒绝执行并返回失败", async () => {
   await writeCommand(directory, "codex", "codex-cli 0.147.0");
 
   try {
-    const result = execute(["update", "codex"], sourceEntry, {
-      ...process.env,
-      PATH: directory,
-    });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /安装和更新需要真实终端/);
+    for (const operation of ["update", "uninstall"]) {
+      const result = execute([operation, "codex"], sourceEntry, {
+        ...process.env,
+        PATH: directory,
+      });
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /安装、更新和卸载需要真实终端/);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -87,4 +91,26 @@ test("帮助包含全部公开子命令", () => {
   assert.match(result.stdout, /status --json/);
   assert.match(result.stdout, /install <tool\.\.\.>/);
   assert.match(result.stdout, /update \[tool\.\.\.\]/);
+  assert.match(result.stdout, /uninstall <tool\.\.\.>/);
+});
+
+test("uninstall 不带工具名时拒绝执行", () => {
+  const result = execute(["uninstall"]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /uninstall 至少需要一个工具名/);
+});
+
+test("uninstall 未安装的工具返回失败", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-path-"));
+
+  try {
+    const result = execute(["uninstall", "codex"], sourceEntry, {
+      ...process.env,
+      PATH: directory,
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Codex 未安装，不能卸载/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

@@ -1,5 +1,5 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { CATALOG, type ActionStep, type ToolId, type ToolRecipe } from "./catalog.js";
 import { NodeCommandRunner } from "./runner.js";
@@ -8,14 +8,14 @@ const SCRIPT_MAX_BYTES = 2 * 1024 * 1024;
 
 export type { ToolId } from "./catalog.js";
 export type ToolState = "missing" | "installed" | "unreadable";
-export type Operation = "install" | "update";
+export type Operation = "install" | "update" | "uninstall";
 
 export interface ToolStatus {
   id: ToolId;
   label: string;
   state: ToolState;
   version?: string;
-  action: Operation;
+  action: "install" | "update";
   preview: string;
 }
 
@@ -57,6 +57,7 @@ export interface CommandRunner {
 
 export interface CliManager {
   scan(): Promise<ToolStatus[]>;
+  preview(action: Action): string;
   run(actions: Action[]): Promise<ActionResult[]>;
 }
 
@@ -78,19 +79,26 @@ function installStep(tool: ToolRecipe, platform: NodeJS.Platform): ActionStep {
   return step;
 }
 
-function actionStep(tool: ToolRecipe, operation: Operation, platform: NodeJS.Platform): ActionStep {
-  return operation === "install"
-    ? installStep(tool, platform)
-    : { kind: "command", program: tool.command, args: tool.updateArgs };
+function actionSteps(tool: ToolRecipe, operation: Operation, platform: NodeJS.Platform): readonly ActionStep[] {
+  if (operation === "install") return [installStep(tool, platform)];
+  if (operation === "update") return [{ kind: "command", program: tool.command, args: tool.updateArgs }];
+  const steps = platform === "win32" ? tool.uninstall.win32 : tool.uninstall.unix;
+  if (!steps) throw new Error(`${tool.label} 不支持当前平台的卸载方式。`);
+  return steps;
 }
 
 function quote(value: string): string {
-  return /^[A-Za-z0-9_./:@=-]+$/.test(value) ? value : JSON.stringify(value);
+  return /^[A-Za-z0-9_./:@=~-]+$/.test(value) ? value : JSON.stringify(value);
 }
 
-function preview(step: ActionStep): string {
+function describeStep(step: ActionStep): string {
   if (step.kind === "script") return `下载 ${step.url}，然后使用 ${step.shell} 执行`;
   return [step.program, ...step.args].map(quote).join(" ");
+}
+
+function expandHome(value: string, env: NodeJS.ProcessEnv): string {
+  if (value !== "~" && !value.startsWith("~/")) return value;
+  return path.join(env.HOME ?? homedir(), value.slice(1));
 }
 
 function isAllowedScriptUrl(url: string, allowedHosts: readonly string[]): boolean {
@@ -146,15 +154,15 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
       ? extractVersion(`${result.stdout}\n${result.stderr}`)
       : undefined;
     const state: ToolState = missing ? "missing" : version ? "installed" : "unreadable";
-    const action: Operation = state === "missing" ? "install" : "update";
-    const step = actionStep(tool, action, platform);
+    const action: "install" | "update" = state === "missing" ? "install" : "update";
+    const step = actionSteps(tool, action, platform)[0];
     return {
       id: tool.id,
       label: tool.label,
       state,
       ...(version ? { version } : {}),
       action,
-      preview: preview(step),
+      preview: describeStep(step),
     };
   };
 
@@ -211,27 +219,53 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
     }
   };
 
+  const runStep = (step: ActionStep): Promise<CommandResult> =>
+    step.kind === "command"
+      ? runner.run(step.program, step.args.map((arg) => expandHome(arg, env)), {
+          stdio: "inherit",
+          env,
+          timeoutMs: options.actionTimeoutMs ?? 10 * 60_000,
+        })
+      : runScript(step);
+
   const runAction = async (action: Action): Promise<ActionResult> => {
     const tool = CATALOG.find((candidate) => candidate.id === action.toolId);
     if (!tool) throw new Error(`未知工具：${action.toolId}`);
     const before = await scanTool(tool);
-    if (before.action !== action.operation) {
+    const stateMatches = action.operation === "install" ? before.state === "missing" : before.state !== "missing";
+    if (!stateMatches) {
       return {
         ...resultBase(tool, action, before, await scanTool(tool)),
         outcome: "failed",
         message: action.operation === "install" ? `${tool.label} 已在 PATH 中生效。` : `${tool.label} 未安装。`,
       };
     }
-    const step = actionStep(tool, action.operation, platform);
+    if (action.operation === "uninstall") {
+      // 卸载步骤尽力执行：单步失败（如未命中实际安装来源）不阻断后续步骤，
+      // 最终以命令是否从 PATH 消失判定结果。
+      let timedOut = false;
+      for (const step of actionSteps(tool, "uninstall", platform)) {
+        let result: CommandResult | undefined;
+        try {
+          result = await runStep(step);
+        } catch {
+          result = undefined;
+        }
+        if (result?.timedOut) {
+          timedOut = true;
+          break;
+        }
+      }
+      const after = await scanTool(tool);
+      const base = resultBase(tool, action, before, after);
+      if (timedOut) return { ...base, outcome: "failed", message: "动作执行超时。" };
+      if (after.state === "missing") return { ...base, outcome: "changed" };
+      return { ...base, outcome: "failed", message: "卸载后命令仍在 PATH 中生效，可能由其他方式安装或存在残留副本。" };
+    }
+    const step = actionSteps(tool, action.operation, platform)[0];
     let execution: CommandResult;
     try {
-      execution = step.kind === "command"
-        ? await runner.run(step.program, step.args, {
-            stdio: "inherit",
-            env,
-            timeoutMs: options.actionTimeoutMs ?? 10 * 60_000,
-          })
-        : await runScript(step);
+      execution = await runStep(step);
     } catch (error: unknown) {
       execution = { code: null, stdout: "", stderr: "", timedOut: false, error: (error as Error).message };
     }
@@ -249,6 +283,11 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
 
   return {
     scan: () => Promise.all(CATALOG.map(scanTool)),
+    preview: (action) => {
+      const tool = CATALOG.find((candidate) => candidate.id === action.toolId);
+      if (!tool) throw new Error(`未知工具：${action.toolId}`);
+      return actionSteps(tool, action.operation, platform).map(describeStep).join(" && ");
+    },
     run: async (actions) => {
       const results: ActionResult[] = [];
       for (const action of actions) results.push(await runAction(action));

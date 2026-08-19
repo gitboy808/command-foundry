@@ -36,11 +36,20 @@ function printDetails(statuses: ToolStatus[], io: CliIo): void {
   for (const status of statuses) io.log(`  ${status.label}：${status.preview}`);
 }
 
-function printPlan(actions: Action[], statuses: ToolStatus[], io: CliIo): void {
+const OPERATION_LABELS: Record<Action["operation"], string> = {
+  install: "安装",
+  update: "更新",
+  uninstall: "卸载",
+};
+
+function printPlan(manager: CliManager, actions: Action[], statuses: ToolStatus[], io: CliIo): void {
   io.log(`确认 ${actions.length} 个动作：`);
   for (const action of actions) {
     const status = statuses.find((candidate) => candidate.id === action.toolId)!;
-    io.log(`  ${action.operation === "install" ? "安装" : "更新"} ${status.label}：${status.preview}`);
+    io.log(`  ${OPERATION_LABELS[action.operation]} ${status.label}：${manager.preview(action)}`);
+  }
+  if (actions.some((action) => action.operation === "uninstall")) {
+    io.log("卸载只移除程序本身，保留各工具的用户数据目录。");
   }
 }
 
@@ -48,9 +57,11 @@ function printResults(results: ActionResult[], io: CliIo): void {
   io.log("完成：");
   for (const result of results) {
     if (result.outcome === "changed") {
-      const change = result.beforeVersion
-        ? `${result.beforeVersion} → ${result.afterVersion}`
-        : `已安装 ${result.afterVersion}`;
+      const change = result.operation === "uninstall"
+        ? `已卸载${result.beforeVersion ? `（${result.beforeVersion}）` : ""}`
+        : result.beforeVersion
+          ? `${result.beforeVersion} → ${result.afterVersion}`
+          : `已安装 ${result.afterVersion}`;
       io.log(`✓ ${result.label} ${change}`);
     } else if (result.outcome === "failed") {
       io.log(`✗ ${result.label} 失败：${result.message ?? "未知错误"}`);
@@ -67,12 +78,12 @@ async function runPlanned(
   io: CliIo,
   prompts: PromptAdapter,
 ): Promise<number> {
-  if (!io.isTTY) throw new Error("安装和更新需要真实终端，以便上游 CLI 正常交互。");
+  if (!io.isTTY) throw new Error("安装、更新和卸载需要真实终端，以便上游 CLI 正常交互。");
   if (actions.length === 0) {
     io.log("没有可执行的操作。");
     return 0;
   }
-  printPlan(actions, statuses, io);
+  printPlan(manager, actions, statuses, io);
   if (!(await prompts.confirm("确认执行以上操作？"))) {
     io.log("已取消，未执行任何操作。");
     return 0;
@@ -83,7 +94,7 @@ async function runPlanned(
 }
 
 async function runInteractive(manager: CliManager, io: CliIo, prompts: PromptAdapter): Promise<number> {
-  if (!io.isTTY) throw new Error("交互模式需要真实终端；请使用 status、install 或 update 子命令。");
+  if (!io.isTTY) throw new Error("交互模式需要真实终端；请使用 status、install、update 或 uninstall 子命令。");
   const statuses = await manager.scan();
   printSummary(statuses, io);
   let intent: "install" | "update";
@@ -116,10 +127,12 @@ function usage(): string {
   ai-cli-manager status --json
   ai-cli-manager install <tool...>
   ai-cli-manager update [tool...]
+  ai-cli-manager uninstall <tool...>
 
-工具：claude、codex、kimi、pi、omp
+工具：claude、codex、kimi、pi、omp、mmx、grok
 
-扫描只读取 PATH 当前生效命令的本地版本；安装和更新执行前均会显示精确计划并确认。`;
+扫描只读取 PATH 当前生效命令的本地版本；安装、更新和卸载执行前均会显示精确计划并确认。
+卸载只移除程序本身，保留各工具的用户数据目录。`;
 }
 
 function printStatuses(statuses: ToolStatus[], io: CliIo): void {
@@ -157,17 +170,19 @@ async function runCli(args: string[]): Promise<number> {
     else printStatuses(statuses, io);
     return 0;
   }
-  if (args[0] === "install" || args[0] === "update") {
+  if (args[0] === "install" || args[0] === "update" || args[0] === "uninstall") {
     const operation = args[0];
     const ids = args.slice(1);
-    if (operation === "install" && ids.length === 0) throw new Error("install 至少需要一个工具名。");
+    if (operation !== "update" && ids.length === 0) throw new Error(`${operation} 至少需要一个工具名。`);
     const statuses = await manager.scan();
     const selected = ids.length > 0
       ? selectedStatuses(statuses, ids)
       : statuses.filter((status) => status.state !== "missing");
     for (const status of selected) {
       if (operation === "install" && status.state !== "missing") throw new Error(`${status.label} 已在 PATH 中生效，不能重复安装。`);
-      if (operation === "update" && status.state === "missing") throw new Error(`${status.label} 未安装，不能更新。`);
+      if (operation !== "install" && status.state === "missing") {
+        throw new Error(`${status.label} 未安装，不能${OPERATION_LABELS[operation]}。`);
+      }
     }
     return runPlanned(
       manager,

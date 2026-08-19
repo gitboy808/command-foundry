@@ -98,6 +98,7 @@ official/npm/Homebrew。替代安装方式属于上游文档；高级用户可�
 ```ts
 interface CliManager {
   scan(): Promise<ToolStatus[]>;
+  preview(action: Action): string;
   run(actions: Action[]): Promise<ActionResult[]>;
 }
 
