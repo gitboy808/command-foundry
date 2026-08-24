@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -25,6 +25,24 @@ class LocalCliRunner implements CommandRunner {
   }
 }
 
+async function scanSources(targets: Record<string, string>) {
+  const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-source-"));
+  const bin = path.join(directory, "bin");
+  try {
+    await mkdir(bin, { recursive: true });
+    for (const [command, relativeTarget] of Object.entries(targets)) {
+      const target = path.join(directory, relativeTarget);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, `#!${process.execPath}\nconsole.log("1.0.0");\n`, { mode: 0o755 });
+      await symlink(target, path.join(bin, command));
+    }
+    const statuses = await createCliManager({ platform: "linux", env: { PATH: bin, HOME: directory } }).scan();
+    return statuses.filter((status) => status.version).map(({ id, source }) => ({ id, source }));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 test("扫描只读取 PATH 当前生效命令的本地版本", async () => {
   const manager = createCliManager({
     runner: new LocalCliRunner({
@@ -38,14 +56,130 @@ test("扫描只读取 PATH 当前生效命令的本地版本", async () => {
   });
 
   assert.deepEqual(await manager.scan(), [
-    { id: "claude", label: "Claude Code", state: "installed", version: "2.1.226", action: "update", preview: "claude update" },
-    { id: "codex", label: "Codex", state: "installed", version: "0.147.0", action: "update", preview: "codex update" },
-    { id: "kimi", label: "Kimi Code", state: "installed", version: "0.34.0", action: "update", preview: "kimi update" },
-    { id: "pi", label: "Pi", state: "installed", version: "0.84.1", action: "update", preview: "pi update --self" },
-    { id: "omp", label: "OMP", state: "missing", action: "install", preview: "下载 https://omp.sh/install，然后使用 sh 执行" },
-    { id: "mmx", label: "MiniMax CLI", state: "missing", action: "install", preview: "npm install -g mmx-cli" },
-    { id: "grok", label: "Grok Build", state: "missing", action: "install", preview: "下载 https://x.ai/cli/install.sh，然后使用 bash 执行" },
+    { id: "claude", label: "Claude Code", state: "installed", version: "2.1.226", source: "unknown" },
+    { id: "codex", label: "Codex", state: "installed", version: "0.147.0", source: "unknown" },
+    { id: "kimi", label: "Kimi Code", state: "installed", version: "0.34.0", source: "unknown" },
+    { id: "pi", label: "Pi", state: "installed", version: "0.84.1", source: "unknown" },
+    { id: "omp", label: "OMP", state: "missing" },
+    { id: "mmx", label: "MiniMax CLI", state: "missing" },
+    { id: "grok", label: "Grok Build", state: "missing" },
   ]);
+});
+
+test("扫描直接对比官网 latest 并标记可更新版本", async () => {
+  const manager = createCliManager({
+    runner: new LocalCliRunner({ claude: "1.0.0 (Claude Code)" }),
+    platform: "linux",
+    env: { PATH: "/test/bin" },
+    fetch: async (input) => {
+      assert.equal(String(input), "https://downloads.claude.ai/claude-code-releases/latest");
+      return new Response("2.0.0");
+    },
+  });
+
+  assert.deepEqual((await manager.scan({ checkLatest: true }))[0], {
+    id: "claude",
+    label: "Claude Code",
+    state: "installed",
+    version: "1.0.0",
+    source: "unknown",
+    latestVersion: "2.0.0",
+    updateState: "outdated",
+  });
+});
+
+test("扫描统一解析 catalog 中所有官方 latest 端点", async () => {
+  const versions = {
+    claude: "1.0.0", codex: "2.0.0", kimi: "3.0.0", pi: "4.0.0",
+    omp: "5.0.0", mmx: "6.0.0", grok: "7.0.0",
+  };
+  const manager = createCliManager({
+    runner: new LocalCliRunner(versions),
+    platform: "linux",
+    env: { PATH: "/test/bin" },
+    fetch: async (input) => {
+      const url = String(input);
+      const bodies: Record<string, string | object> = {
+        "https://downloads.claude.ai/claude-code-releases/latest": "1.0.0",
+        "https://releases.openai.com/codex/channels/latest": { tag_name: "rust-v2.0.0" },
+        "https://code.kimi.com/kimi-code/latest": "3.0.0",
+        "https://pi.dev/api/latest-version": { version: "4.0.0" },
+        "https://registry.npmjs.org/@oh-my-pi%2fpi-coding-agent/latest": { version: "5.0.0" },
+        "https://registry.npmjs.org/mmx-cli/latest": { version: "6.0.0" },
+        "https://x.ai/cli/stable": "7.0.0",
+      };
+      const body = bodies[url];
+      assert.ok(body, `未声明的 latest URL：${url}`);
+      return typeof body === "string" ? new Response(body) : Response.json(body);
+    },
+  });
+
+  assert.deepEqual(
+    (await manager.scan({ checkLatest: true })).map(({ id, latestVersion, updateState }) => ({ id, latestVersion, updateState })),
+    Object.entries(versions).map(([id, latestVersion]) => ({ id, latestVersion, updateState: "current" })),
+  );
+});
+
+test("扫描将同版本号的预发布版本判定为低于正式版", async () => {
+  const manager = createCliManager({
+    runner: new LocalCliRunner({ claude: "2.0.0-beta.1" }),
+    platform: "linux",
+    env: { PATH: "/test/bin" },
+    fetch: async () => new Response("2.0.0"),
+  });
+
+  assert.equal((await manager.scan({ checkLatest: true }))[0]?.updateState, "outdated");
+});
+
+test("扫描从 PATH 当前命令的真实路径区分安装来源", { skip: process.platform === "win32" }, async () => {
+  assert.deepEqual(await scanSources({
+    claude: ".local/share/claude/versions/2.1.241",
+    codex: "n/lib/node_modules/@openai/codex/bin/codex.js",
+    kimi: ".local/share/mise/installs/kimi/1.0.0/bin/kimi",
+    pi: "custom/pi",
+    omp: "homebrew/Cellar/omp/1.0.0/bin/omp",
+    mmx: ".bun/install/global/node_modules/mmx-cli/bin/mmx",
+    grok: ".local/share/pnpm/global/5/node_modules/@xai-official/grok/bin/grok",
+  }), [
+    { id: "claude", source: "official" },
+    { id: "codex", source: "npm" },
+    { id: "kimi", source: "mise" },
+    { id: "pi", source: "unknown" },
+    { id: "omp", source: "homebrew" },
+    { id: "mmx", source: "bun" },
+    { id: "grok", source: "pnpm" },
+  ]);
+});
+
+test("扫描识别 catalog 声明的官方安装目录", { skip: process.platform === "win32" }, async () => {
+  assert.deepEqual(await scanSources({
+    codex: ".codex/packages/standalone/releases/1.0.0/bin/codex",
+    kimi: ".kimi-code/bin/kimi",
+    omp: ".local/bin/omp",
+    grok: ".grok/downloads/grok-darwin-arm64",
+  }), [
+    { id: "codex", source: "official" },
+    { id: "kimi", source: "official" },
+    { id: "omp", source: "official" },
+    { id: "grok", source: "official" },
+  ]);
+});
+
+test("扫描识别 Windows npm 全局命令 shim", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-npm-shim-"));
+  const npmBin = path.join(directory, "AppData", "Roaming", "npm");
+  try {
+    await mkdir(npmBin, { recursive: true });
+    await writeFile(path.join(npmBin, "codex.CMD"), "@echo off\r\n");
+    const statuses = await createCliManager({
+      runner: new LocalCliRunner({ codex: "codex-cli 0.149.1" }),
+      platform: "win32",
+      env: { PATH: npmBin, PATHEXT: ".CMD" },
+    }).scan();
+    assert.equal(statuses.find(({ id }) => id === "codex")?.source, "npm");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("更新委托给 PATH 中的上游命令并在继承终端后复检版本", async () => {
@@ -185,7 +319,7 @@ test("退出码为零但版本不变时保持中性，单项异常不阻断后�
       outcome: "unchanged",
       beforeVersion: "1.0.0",
       afterVersion: "1.0.0",
-      message: "版本无变化（已是最新，或上游给出了手动步骤）。",
+      message: "版本无变化（未核验官网最新版，或上游给出了手动步骤）。",
     },
     {
       toolId: "codex",
@@ -205,6 +339,34 @@ test("退出码为零但版本不变时保持中性，单项异常不阻断后�
       afterVersion: "1.1.0",
     },
   ]);
+});
+
+test("更新器返回成功但仍低于官网版本时不报告最新版", async () => {
+  const runner: CommandRunner = {
+    async run(_program, _args, options) {
+      return options.stdio === "capture"
+        ? { code: 0, stdout: "1.0.0", stderr: "", timedOut: false }
+        : { code: 0, stdout: "", stderr: "", timedOut: false };
+    },
+  };
+  const manager = createCliManager({
+    runner,
+    platform: "linux",
+    fetch: async () => new Response("2.0.0"),
+  });
+
+  assert.deepEqual(await manager.run(
+    [{ toolId: "claude", operation: "update" }],
+    { verifyLatest: true },
+  ), [{
+    toolId: "claude",
+    label: "Claude Code",
+    operation: "update",
+    outcome: "unchanged",
+    beforeVersion: "1.0.0",
+    afterVersion: "1.0.0",
+    message: "版本无变化，仍低于官网最新版 2.0.0。",
+  }]);
 });
 
 test("OMP 缺失时只执行 catalog 中的推荐安装脚本并复检版本", async () => {

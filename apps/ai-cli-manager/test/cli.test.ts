@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -43,25 +43,45 @@ test("通过 npm 风格的符号链接启动 CLI", { skip: process.platform === 
   }
 });
 
-test("status --json 通过真实入口输出纯本地状态", async () => {
+test("status --json --local 通过真实入口输出纯本地状态", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-path-"));
   await writeCommand(directory, "claude", "2.1.226 (Claude Code)");
 
   try {
-    const result = execute(["status", "--json"], sourceEntry, {
+    const result = execute(["status", "--json", "--local"], sourceEntry, {
       ...process.env,
       PATH: directory,
     });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), [
-      { id: "claude", label: "Claude Code", state: "installed", version: "2.1.226", action: "update", preview: "claude update" },
-      { id: "codex", label: "Codex", state: "missing", action: "install", preview: "下载 https://chatgpt.com/codex/install.sh，然后使用 sh 执行" },
-      { id: "kimi", label: "Kimi Code", state: "missing", action: "install", preview: "下载 https://code.kimi.com/kimi-code/install.sh，然后使用 bash 执行" },
-      { id: "pi", label: "Pi", state: "missing", action: "install", preview: "npm install -g --ignore-scripts @earendil-works/pi-coding-agent" },
-      { id: "omp", label: "OMP", state: "missing", action: "install", preview: "下载 https://omp.sh/install，然后使用 sh 执行" },
-      { id: "mmx", label: "MiniMax CLI", state: "missing", action: "install", preview: "npm install -g mmx-cli" },
-      { id: "grok", label: "Grok Build", state: "missing", action: "install", preview: "下载 https://x.ai/cli/install.sh，然后使用 bash 执行" },
+      { id: "claude", label: "Claude Code", state: "installed", version: "2.1.226", source: "unknown" },
+      { id: "codex", label: "Codex", state: "missing" },
+      { id: "kimi", label: "Kimi Code", state: "missing" },
+      { id: "pi", label: "Pi", state: "missing" },
+      { id: "omp", label: "OMP", state: "missing" },
+      { id: "mmx", label: "MiniMax CLI", state: "missing" },
+      { id: "grok", label: "Grok Build", state: "missing" },
     ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("status 在版本旁展示 PATH 当前命令的推断来源", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-source-"));
+  const bin = path.join(directory, "bin");
+  const packageBin = path.join(directory, "n", "lib", "node_modules", "@openai", "codex", "bin");
+
+  try {
+    await mkdir(bin, { recursive: true });
+    await mkdir(packageBin, { recursive: true });
+    await writeCommand(packageBin, "codex", "codex-cli 0.149.1");
+    await symlink(path.join(packageBin, "codex"), path.join(bin, "codex"));
+
+    const result = execute(["status", "--local"], sourceEntry, { ...process.env, PATH: bin });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Codex\s+0\.149\.1 · npm/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

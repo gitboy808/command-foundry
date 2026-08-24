@@ -1,7 +1,7 @@
 # ai-cli-manager 简化设计提案
 
-> 状态：设计候选；尚未修改生产代码。
-> 目标：加入 OMP，同时减少代码量、概念数量和用户决策。
+> 状态：核心设计已落地；2026-08-24 增补只读来源推断与官网 latest 核验。
+> 目标：扩大工具覆盖，同时减少代码量、概念数量和用户决策。
 
 ## 结论
 
@@ -11,7 +11,7 @@ WinGet 等安装管理器的统一抽象。它只需要管理当前 shell 实际
 1. 用各 CLI 的 `--version` 判断“已安装 / 未安装 / 版本不可读”；
 2. 未安装时只提供一个经过审查的推荐安装入口；
 3. 已安装时调用该 CLI 自己的更新命令；
-4. 更新后重新读取版本，只报告“已变化 / 无变化 / 失败”，不猜测安装来源；
+4. 更新后重新读取版本，并独立对比官网 latest；安装来源不参与动作决策；
 5. 详细模式才展示实际命令和上游输出。
 
 这是有意缩小产品承诺。管理器负责发现、编排、安全执行和一致呈现；安装归属识别、
@@ -19,7 +19,7 @@ WinGet 等安装管理器的统一抽象。它只需要管理当前 shell 实际
 
 ## 为什么当前模型越来越浅
 
-当前生产代码共 1,177 行，其中 `detector.ts` 占 404 行。现有接口要求每个工具都声明
+重构前生产代码共 1,177 行，其中 `detector.ts` 占 404 行。旧接口要求每个工具都声明
 `official`、`npm`、`homebrew` 三种来源，再由 detector 盘点 PATH、npm 全局目录、
 Homebrew prefix 和官方 marker。这个模型有三个结构性问题：
 
@@ -29,8 +29,9 @@ Homebrew prefix 和官方 marker。这个模型有三个结构性问题：
 - 管理器绕开了上游更深的更新实现，例如 OMP 的来源识别、依赖版本锁定、校验、回滚，
   以及 Pi 的包 scope 迁移。
 
-继续扩展 `Source` 联合类型只会增加浅层 adapter 和分支。删除模块后，这些复杂性不会
-转移到调用方，而是直接消失，因此来源盘点模块没有通过 deletion test。
+继续为每种来源扩展 inventory、latest 和动作 adapter 只会增加浅层分支。删除模块后，
+这些复杂性不会转移到调用方，而是直接消失，因此重量级来源盘点模块没有通过 deletion
+test。当前实现只保留不驱动动作的路径标签。
 
 ## 最大程度复用上游能力
 
@@ -50,7 +51,7 @@ Homebrew prefix 和官方 marker。这个模型有三个结构性问题：
 - [Pi](../research/pi-install-and-update.md)
 - [OMP](../research/omp-install-and-update.md)
 
-安装不能委托给尚未存在的 CLI，因此 catalog 仍需保留五条推荐安装 recipe。更新则一律
+安装不能委托给尚未存在的 CLI，因此 catalog 仍需保留各工具的推荐安装 recipe。更新则一律
 先委托当前 PATH 中生效的命令。Kimi 的 TTY 差异不应变成专用更新实现：动作执行阶段
 统一继承终端，既让 Kimi 正常询问，也让其他 CLI 的进度输出保持原样。
 
@@ -62,28 +63,31 @@ PATH 决定用户输入 `codex` 时实际运行哪一个 Codex。管理器只扫
 如果机器上还有一个被 PATH 遮蔽的副本，它不属于默认界面的关键信息，也不应驱动更新
 计划。需要排查时，可在详细模式中提示用户使用系统工具检查 PATH。
 
-这个决定允许删除：
+这个决定允许删除重量级来源盘点：
 
 - npm global inventory；
 - Homebrew inventory；
 - official marker 和 path prefix 规则；
-- `Source`、`Installation[]`、confidence、evidence、legacy source 状态；
+- `Installation[]`、confidence、evidence、legacy source 状态；
 - 安装来源选择器及其可用性探测；
 - 按来源查询 latest 的分支。
 
-### 不在扫描阶段判断“已是最新”
+### 独立核验官网 latest，不信任 updater 的“最新版”结论
 
-只有 OMP 提供稳定的只读 `--check`，其他工具的更新检查在通道、TTY 和安装来源上语义
-不同。为了一个不一致的绿色勾选维护五套 latest 协议，收益小于复杂度。
+updater 仍负责实际更新，但它可能受 stable 通道、npm 镜像、本地配置或 PATH 副本影响。
+管理器不解析 updater 文本，而是直接读取 catalog 声明的官方 HTTPS 端点，并通过共享解析
+逻辑得到 `latestVersion`。这不是来源 inventory：每个工具只增加 URL 和可选 JSON 字段名，
+没有来源专用 adapter。
 
-默认扫描应完全本地化，只展示当前版本。用户选择更新后，上游 updater 自己判断是否
-需要动作。执行前后版本比较提供三个不会误导的结果：
+默认 `status` 联网核验，`status --local` 保留完全本地化扫描。结果只允许四种语义：
 
-- 版本变化：`已更新 0.147.0 → 0.148.0`；
-- 版本未变且退出码为 0：`无变化（已是最新，或上游给出了手动步骤）`；
-- 非零退出：`失败`，保留上游错误输出。
+- `current`：本地版本严格等于官网 latest；
+- `outdated`：本地版本低于官网 latest；
+- `ahead`：本地版本高于官网 latest，例如预发布或分阶段发布；
+- `unavailable`：网络、HTTP、体积或解析失败，绝不降级成“最新版”。
 
-因此可以删除 `--offline` 以及远程 latest 获取逻辑。不要把“无变化”写成“成功更新”。
+写操作仍先委托上游 updater，再重新读取本地版本并请求官网 latest。退出码 0、版本不变但
+仍低于官网时，必须明确报告目标版本，不能写“已是最新”。
 
 ### 安装只给一个默认入口
 
@@ -97,9 +101,9 @@ official/npm/Homebrew。替代安装方式属于上游文档；高级用户可�
 
 ```ts
 interface CliManager {
-  scan(): Promise<ToolStatus[]>;
+  scan(options?: { checkLatest?: boolean }): Promise<ToolStatus[]>;
   preview(action: Action): string;
-  run(actions: Action[]): Promise<ActionResult[]>;
+  run(actions: Action[], options?: { verifyLatest?: boolean }): Promise<ActionResult[]>;
 }
 
 interface ToolStatus {
@@ -107,26 +111,29 @@ interface ToolStatus {
   label: string;
   state: "missing" | "installed" | "unreadable";
   version?: string;
-  action: "install" | "update";
-  preview: string;
+  source?: "official" | "homebrew" | "npm" | "bun" | "pnpm" | "mise" | "unknown";
+  latestVersion?: string;
+  updateState?: "current" | "outdated" | "ahead" | "unavailable";
 }
 ```
 
-`catalog`、PATH 命令解析、recipe 生成、安全脚本下载、进程生命周期、更新后复检都放在
-实现内部。`CommandRunner` 仍是合理的内部 seam，因为它已有真实进程 adapter 与测试
-adapter 两种实现。
+`catalog`、PATH 命令与真实路径解析、只读来源推断、官网 latest 解析、recipe 生成、
+安全脚本下载、进程生命周期、更新后复检都放在实现内部。来源推断只匹配当前命令的路径
+布局，不读取包管理器 inventory，也不驱动更新或卸载。`CommandRunner` 和注入的 `fetch`
+是合理的内部 seam：生产使用真实进程与网络，测试使用本地 adapter。
 
 ```mermaid
 flowchart LR
   CLI["CLI / 极简交互"] -->|"scan(), run(actions)"| Manager["manager 深模块"]
-  Manager --> Catalog["五个工具的静态 recipe"]
+  Manager --> Catalog["各工具的静态 recipe"]
   Manager --> Runner["capture 扫描 / inherit 动作"]
+  Manager --> Latest["官网 latest HTTPS"]
   Runner --> Upstream["各 CLI updater 或官方安装器"]
   Upstream --> Manager
   Manager -->|"版本前后变化 + 退出状态"| CLI
 ```
 
-不建议为五个工具各建 class 或公开 adapter interface。当前差异能由静态 recipe 表达，
+不建议为每个工具各建 class 或公开 adapter interface。当前差异能由静态 recipe 表达，
 只有一个实现的 seam 只是额外间接层。若未来确实出现第二种不可数据化行为，再提取内部
 adapter。
 
@@ -136,16 +143,16 @@ adapter。
 
 ```text
 ai-cli-manager                 # 交互选择
-ai-cli-manager status          # 本地版本状态
+ai-cli-manager status          # 本地版本与官网 latest 对比
 ai-cli-manager status --json   # 机器可读状态
+ai-cli-manager status --local  # 完全本地化扫描
 ai-cli-manager install omp     # 安装缺失工具
 ai-cli-manager update          # 更新全部已安装工具
 ai-cli-manager update codex pi # 更新指定工具
 ```
 
-默认交互只展示三类关键信息：工具、当前版本或“未安装”、将执行的动作。来源、PATH、
-完整命令和说明通过 `D` 展开。选择后再显示一次精确计划并确认，避免把所有审计信息长期
-铺在主列表里。
+默认交互展示工具、当前版本或“未安装”、推断来源和将执行的动作。PATH、完整命令和说明
+通过 `D` 展开。选择后再显示一次精确计划并确认，避免把所有审计信息长期铺在主列表里。
 
 推荐采用原型中的 **C：渐进披露**：
 
@@ -162,13 +169,15 @@ ai-cli-manager update codex pi # 更新指定工具
 
 这次重构应设删除预算，而不是在旧模型上叠加 OMP：
 
-- 删除来源 inventory、marker、source availability、source picker 和 remote latest；
+- 删除来源 inventory、source availability 和 source picker；latest 只保留 catalog URL 与
+  一套共享解析逻辑；
 - 保留 runner 的超时、进程树终止、`shell: false` 与脚本 HTTPS 白名单；
 - 新增 OMP 只应是一条 catalog 数据，而不是新的 detector 分支；
 - 测试改为穿过 `manager` 接口验证可观察行为，旧的来源实现测试直接删除。
 
-预计新增的 OMP recipe、交互执行模式和子命令解析应明显少于被删除的代码。验收时可以
-使用硬约束：重构后的 `src/` 总行数必须低于当前 1,177 行，并且 catalog 外不允许出现
+2026-08-24 增补来源展示与官网 latest 核验后，`src/` 总行数为 844 行，仍比重构前少
+333 行。后续继续使用
+硬约束：功能改动不得无理由突破既有生产代码基线，并且 catalog 外不允许出现
 `tool.id === ...` 的工具专用分支。
 
 ## 明确保留的安全能力

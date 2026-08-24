@@ -1,7 +1,9 @@
 # ai-cli-manager
 
 管理当前 `PATH` 中生效的 Claude Code、Codex、Kimi Code、Pi、OMP、MiniMax CLI 与
-Grok Build。它只负责发现、编排和呈现结果，不盘点 `PATH` 外的副本，也不判断安装来源或远程最新版本。
+Grok Build。它不盘点 `PATH` 外的副本；安装来源仅根据当前命令的 PATH 路径与符号链接
+做本地推断，不参与动作决策。`status` 默认直接查询 catalog 声明的官网 latest 端点，
+避免把本地 updater、包管理器镜像或环境配置给出的结果误写成“最新版”。
 
 要求 Node.js 22.19 或更高版本。
 
@@ -28,8 +30,9 @@ npm run build
 
 ```bash
 ai-cli-manager                 # 交互模式：选择安装全部缺失工具或更新全部已安装工具
-ai-cli-manager status          # 输出当前 PATH 中各工具的本地版本状态
+ai-cli-manager status          # 输出本地版本、安装来源和官网 latest 对比
 ai-cli-manager status --json   # 输出相同状态的 JSON
+ai-cli-manager status --local  # 只读本地状态，不访问网络
 ai-cli-manager install omp     # 安装一个缺失工具
 ai-cli-manager install omp pi  # 按参数顺序安装多个缺失工具
 ai-cli-manager update          # 按 catalog 顺序更新全部已安装工具
@@ -43,14 +46,21 @@ ai-cli-manager --version       # 显示自身版本
 
 ### 状态扫描
 
-扫描只执行每个工具的 `--version`：
+扫描执行每个工具的 `--version`，读取 PATH 当前命令及其符号链接的真实路径，并在默认模式
+下并行查询官网 latest：
 
 - 命令不存在：`missing` / “未安装”；
-- 命令成功且能提取版本：`installed` / 当前版本；
+- 命令成功且能提取版本：`installed` / 当前版本与推断来源；
 - 命令存在但执行失败或版本不可解析：`unreadable` / “版本不可读”。
 
-扫描不访问网络、不查询远程最新版，也不会读取 npm、Homebrew 或其他包管理器的安装
-清单。`status --json` 适合脚本读取，且不会进入交互。
+来源可能是 `official`、`homebrew`、`npm`、`bun`、`pnpm`、`mise` 或 `unknown`。它只描述
+当前 PATH 中生效的命令；自定义安装目录、系统包管理器或手工复制的二进制可能显示为
+“其他/未知”。latest 状态为 `current`、`outdated`、`ahead` 或 `unavailable`；只有本地版本
+与官网响应相等时才显示“官网最新版”，网络或解析失败一律显示“官网版本不可用”。
+
+latest 请求直接访问 catalog 中固定的 HTTPS URL，不调用 `npm view`、Homebrew 或上游
+updater，也不受本机 npm registry 配置影响。`status --local` 完全跳过这些请求；可与
+`--json` 组合。`status --json` 适合脚本读取，且不会进入交互。
 
 ### 安装与更新
 
@@ -76,7 +86,8 @@ ai-cli-manager --version       # 显示自身版本
 `ai-cli-manager status` 核验。
 
 MiniMax CLI 上游当前版本的 `mmx update` 只打印手动更新指引（`npm update -g mmx-cli`）
-而不执行更新；管理器执行后读不到版本变化，会如实报告「无变化」。
+而不执行更新；若本地版本仍落后，管理器会如实报告官网最新版，不会把退出码 0 当成
+“已是最新”。
 
 Grok Build 的后台自动更新默认开启，日常使用 `grok` 本身就可能升级版本，管理器扫描到的
 版本可能在两次操作之间自行漂移；这是上游默认行为，不是异常。
@@ -112,7 +123,8 @@ Windows 上会明确报告「不支持当前平台的卸载方式」。
 每个动作结束后都会重新执行 `--version`：
 
 - 前后版本不同：显示版本变化；
-- 上游退出码为 0、版本不变：中性显示“无变化”，不会写成“成功更新”；
+- 上游退出码为 0、版本不变：再次直连官网核验，明确显示“官网最新版”“仍低于官网
+  最新版”或“无法核验”；
 - 上游非零退出、超时或动作后版本不可读：显示“失败”。
 
 卸载动作的判定相反：命令从 PATH 中消失（`--version` 不再可执行）才算成功；执行后
@@ -123,12 +135,13 @@ Windows 上会明确报告「不支持当前平台的卸载方式」。
 - `0`：只读命令成功、用户取消，或全部动作均未失败；
 - `1`：参数错误、缺少真实终端，或至少一个动作失败。
 
-上游输出直接显示在终端中；管理器不解析上游文本，也不猜测“无变化”的具体原因。
+上游输出直接显示在终端中；管理器不解析上游文本，latest 结论只来自独立官网请求。
 
 ## 安全与执行边界
 
 - 所有子进程均使用 `shell: false`，程序与参数分开传递；
 - 上游动作继承终端，扫描与版本复检只捕获有限大小的输出；
+- latest 请求超时为 5 秒，响应上限为 1 MiB；失败降级为“无法核验”；
 - 安装脚本只允许 catalog 中声明的 HTTPS 域名，每一跳重定向都会重新校验；
 - 脚本下载限制为 2 MiB，写入权限受限的临时文件，执行后始终清理；
 - 下载和动作均有超时；动作超时会先终止整个进程树，再强制终止；

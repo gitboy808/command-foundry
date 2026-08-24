@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, constants, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { CATALOG, type ActionStep, type ToolId, type ToolRecipe } from "./catalog.js";
@@ -7,6 +7,8 @@ import { NodeCommandRunner } from "./runner.js";
 const SCRIPT_MAX_BYTES = 2 * 1024 * 1024;
 
 export type { ToolId } from "./catalog.js";
+export type InstallSource = "official" | "homebrew" | "npm" | "bun" | "pnpm" | "mise" | "unknown";
+export type UpdateState = "current" | "outdated" | "ahead" | "unavailable";
 export type ToolState = "missing" | "installed" | "unreadable";
 export type Operation = "install" | "update" | "uninstall";
 
@@ -15,8 +17,9 @@ export interface ToolStatus {
   label: string;
   state: ToolState;
   version?: string;
-  action: "install" | "update";
-  preview: string;
+  source?: InstallSource;
+  latestVersion?: string;
+  updateState?: UpdateState;
 }
 
 export interface Action {
@@ -56,9 +59,9 @@ export interface CommandRunner {
 }
 
 export interface CliManager {
-  scan(): Promise<ToolStatus[]>;
+  scan(options?: { checkLatest?: boolean }): Promise<ToolStatus[]>;
   preview(action: Action): string;
-  run(actions: Action[]): Promise<ActionResult[]>;
+  run(actions: Action[], options?: { verifyLatest?: boolean }): Promise<ActionResult[]>;
 }
 
 export interface ManagerOptions {
@@ -73,15 +76,67 @@ function extractVersion(value: string): string | undefined {
   return value.match(/\bv?(\d+(?:\.\d+){1,3}(?:-[0-9A-Za-z.-]+)?)(?:\+[0-9A-Za-z.-]+)?\b/)?.[1];
 }
 
-function installStep(tool: ToolRecipe, platform: NodeJS.Platform): ActionStep {
-  const step = platform === "win32" ? tool.install.win32 : tool.install.unix;
-  if (!step) throw new Error(`${tool.label} 不支持当前平台的推荐安装方式。`);
-  return step;
+function compareVersions(left: string, right: string): number {
+  const [leftCore, leftPre] = left.split("-", 2);
+  const [rightCore, rightPre] = right.split("-", 2);
+  const leftParts = leftCore!.split(".").map(Number);
+  const rightParts = rightCore!.split(".").map(Number);
+  for (let index = 0; index < Math.max(leftParts.length, rightParts.length); index += 1) {
+    const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  if (!leftPre || !rightPre) return leftPre ? -1 : rightPre ? 1 : 0;
+  return leftPre.localeCompare(rightPre, undefined, { numeric: true, sensitivity: "base" });
+}
+
+function unchangedMessage(status: ToolStatus): string {
+  return status.updateState === "current" ? `已是官网最新版 ${status.latestVersion}。`
+    : status.updateState === "outdated" ? `版本无变化，仍低于官网最新版 ${status.latestVersion}。`
+      : status.updateState === "ahead" ? `本地版本高于官网最新版 ${status.latestVersion}。`
+        : status.updateState === "unavailable" ? "版本无变化，无法核验官网最新版。"
+          : "版本无变化（未核验官网最新版，或上游给出了手动步骤）。";
+}
+
+async function commandPaths(
+  command: string,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): Promise<readonly string[] | undefined> {
+  const extensions = platform === "win32"
+    ? (env.PATHEXT?.trim() || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map((extension) => extension.startsWith(".") ? extension : `.${extension}`)
+    : [""];
+  for (const directory of (env.PATH ?? "").split(path.delimiter)) {
+    for (const extension of extensions) {
+      const candidate = path.resolve(directory || ".", `${command}${extension}`);
+      try {
+        await access(candidate, platform === "win32" ? constants.F_OK : constants.X_OK);
+        return [candidate, await realpath(candidate).catch(() => candidate)];
+      } catch {
+        // Try the next PATH entry.
+      }
+    }
+  }
+  return undefined;
+}
+
+function inferSource(tool: ToolRecipe, paths: readonly string[]): InstallSource {
+  const value = paths.map((candidate) => candidate.replaceAll("\\", "/").toLowerCase()).join("\n");
+  if (value.includes("/cellar/") || value.includes("/caskroom/")) return "homebrew";
+  if (value.includes("/.bun/")) return "bun";
+  if (value.includes("/pnpm/") || value.includes("/.pnpm/")) return "pnpm";
+  if (value.includes("/.local/share/mise/") || value.includes("/.mise/")) return "mise";
+  if (value.includes("/lib/node_modules/") || value.includes("/npm/node_modules/") || value.includes("/appdata/roaming/npm/")) return "npm";
+  if (tool.officialPathHints?.some((hint) => value.includes(hint.toLowerCase()))) return "official";
+  return "unknown";
 }
 
 function actionSteps(tool: ToolRecipe, operation: Operation, platform: NodeJS.Platform): readonly ActionStep[] {
-  if (operation === "install") return [installStep(tool, platform)];
-  if (operation === "update") return [{ kind: "command", program: tool.command, args: tool.updateArgs }];
+  if (operation === "install") {
+    const step = platform === "win32" ? tool.install.win32 : tool.install.unix;
+    if (!step) throw new Error(`${tool.label} 不支持当前平台的推荐安装方式。`);
+    return [step];
+  }
+  if (operation === "update") return [{ kind: "command", program: tool.id, args: tool.updateArgs ?? ["update"] }];
   const steps = platform === "win32" ? tool.uninstall.win32 : tool.uninstall.unix;
   if (!steps) throw new Error(`${tool.label} 不支持当前平台的卸载方式。`);
   return steps;
@@ -142,8 +197,26 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
   const env = options.env ?? process.env;
   const runner = options.runner ?? new NodeCommandRunner();
 
-  const scanTool = async (tool: ToolRecipe): Promise<ToolStatus> => {
-    const result = await runner.run(tool.command, tool.versionArgs, {
+  const readLatest = async (tool: ToolRecipe): Promise<string | undefined> => {
+    try {
+      const response = await (options.fetch ?? fetch)(tool.latest.url, {
+        signal: AbortSignal.timeout(5_000),
+        headers: { accept: "application/json,text/plain", "cache-control": "no-cache" },
+      });
+      if (!response.ok) return undefined;
+      const body = await response.text();
+      if (body.length > 1024 * 1024) return undefined;
+      const value = tool.latest.field
+        ? (JSON.parse(body) as Record<string, unknown>)[tool.latest.field]
+        : body;
+      return typeof value === "string" ? extractVersion(value) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const scanTool = async (tool: ToolRecipe, checkLatest = false): Promise<ToolStatus> => {
+    const result = await runner.run(tool.id, ["--version"], {
       stdio: "capture",
       env,
       timeoutMs: 15_000,
@@ -154,15 +227,21 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
       ? extractVersion(`${result.stdout}\n${result.stderr}`)
       : undefined;
     const state: ToolState = missing ? "missing" : version ? "installed" : "unreadable";
-    const action: "install" | "update" = state === "missing" ? "install" : "update";
-    const step = actionSteps(tool, action, platform)[0];
+    const paths = missing ? undefined : await commandPaths(tool.id, env, platform);
+    const latestVersion = checkLatest && version ? await readLatest(tool) : undefined;
+    const updateState: UpdateState | undefined = checkLatest && version
+      ? latestVersion
+        ? compareVersions(version, latestVersion) < 0 ? "outdated" : compareVersions(version, latestVersion) > 0 ? "ahead" : "current"
+        : "unavailable"
+      : undefined;
     return {
       id: tool.id,
       label: tool.label,
       state,
       ...(version ? { version } : {}),
-      action,
-      preview: describeStep(step),
+      ...(!missing ? { source: paths ? inferSource(tool, paths) : "unknown" as const } : {}),
+      ...(latestVersion ? { latestVersion } : {}),
+      ...(updateState ? { updateState } : {}),
     };
   };
 
@@ -228,7 +307,7 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
         })
       : runScript(step);
 
-  const runAction = async (action: Action): Promise<ActionResult> => {
+  const runAction = async (action: Action, verifyLatest = false): Promise<ActionResult> => {
     const tool = CATALOG.find((candidate) => candidate.id === action.toolId);
     if (!tool) throw new Error(`未知工具：${action.toolId}`);
     const before = await scanTool(tool);
@@ -269,7 +348,7 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
     } catch (error: unknown) {
       execution = { code: null, stdout: "", stderr: "", timedOut: false, error: (error as Error).message };
     }
-    const after = await scanTool(tool);
+    const after = await scanTool(tool, verifyLatest && !execution.timedOut && execution.code === 0);
     const base = resultBase(tool, action, before, after);
     if (execution.timedOut || execution.code !== 0) {
       const message = execution.error
@@ -278,19 +357,19 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
     }
     if (!after.version) return { ...base, outcome: "failed", message: "动作完成，但无法重新读取版本。" };
     if (after.version && after.version !== before.version) return { ...base, outcome: "changed" };
-    return { ...base, outcome: "unchanged", message: "版本无变化（已是最新，或上游给出了手动步骤）。" };
+    return { ...base, outcome: "unchanged", message: unchangedMessage(after) };
   };
 
   return {
-    scan: () => Promise.all(CATALOG.map(scanTool)),
+    scan: ({ checkLatest = false } = {}) => Promise.all(CATALOG.map((tool) => scanTool(tool, checkLatest))),
     preview: (action) => {
       const tool = CATALOG.find((candidate) => candidate.id === action.toolId);
       if (!tool) throw new Error(`未知工具：${action.toolId}`);
       return actionSteps(tool, action.operation, platform).map(describeStep).join(" && ");
     },
-    run: async (actions) => {
+    run: async (actions, { verifyLatest = false } = {}) => {
       const results: ActionResult[] = [];
-      for (const action of actions) results.push(await runAction(action));
+      for (const action of actions) results.push(await runAction(action, verifyLatest));
       return results;
     },
   };

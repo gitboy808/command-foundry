@@ -1,39 +1,50 @@
 #!/usr/bin/env node
+import { confirm, select } from "@inquirer/prompts";
 import {
   createCliManager,
   type Action,
   type ActionResult,
   type CliManager,
+  type InstallSource,
   type ToolStatus,
 } from "./manager.js";
-import { inquirerPrompts, type PromptAdapter } from "./ui.js";
 
 const VERSION = "0.1.0";
+type Intent = "install" | "update" | "details" | "cancel";
+const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 
-interface CliIo {
-  log(message?: string): void;
-  isTTY: boolean;
-}
-
-const defaultIo: CliIo = {
-  log: (message = "") => console.log(message),
-  isTTY: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+const SOURCE_LABELS: Record<InstallSource, string> = {
+  official: "官方安装器",
+  homebrew: "Homebrew",
+  npm: "npm",
+  bun: "Bun",
+  pnpm: "pnpm",
+  mise: "mise",
+  unknown: "其他/未知",
 };
 
 function statusValue(status: ToolStatus): string {
-  if (status.version) return status.version;
-  return status.state === "unreadable" ? "版本不可读" : "—";
+  const value = status.version ?? (status.state === "unreadable" ? "版本不可读" : "—");
+  const update = status.updateState === "current" ? "官网最新版"
+    : status.updateState === "outdated" ? `可更新至 ${status.latestVersion}`
+      : status.updateState === "ahead" ? `高于官网 ${status.latestVersion}`
+        : status.updateState === "unavailable" ? "官网版本不可用"
+          : undefined;
+  return [value, status.source ? SOURCE_LABELS[status.source] : undefined, update].filter(Boolean).join(" · ");
 }
 
-function printSummary(statuses: ToolStatus[], io: CliIo): void {
+function printSummary(statuses: ToolStatus[]): void {
   const missing = statuses.filter((status) => status.state === "missing").length;
-  io.log(`${statuses.length - missing} 已安装 · ${missing} 未安装`);
-  io.log(statuses.map((status) => `${status.label} ${statusValue(status)}`).join(" · "));
+  console.log(`${statuses.length - missing} 已安装 · ${missing} 未安装`);
+  console.log(statuses.map((status) => `${status.label} ${statusValue(status)}`).join(" · "));
 }
 
-function printDetails(statuses: ToolStatus[], io: CliIo): void {
-  io.log("精确命令：");
-  for (const status of statuses) io.log(`  ${status.label}：${status.preview}`);
+function printDetails(manager: CliManager, statuses: ToolStatus[]): void {
+  console.log("精确命令：");
+  for (const status of statuses) console.log(`  ${status.label}：${manager.preview({
+    toolId: status.id,
+    operation: status.state === "missing" ? "install" : "update",
+  })}`);
 }
 
 const OPERATION_LABELS: Record<Action["operation"], string> = {
@@ -42,19 +53,19 @@ const OPERATION_LABELS: Record<Action["operation"], string> = {
   uninstall: "卸载",
 };
 
-function printPlan(manager: CliManager, actions: Action[], statuses: ToolStatus[], io: CliIo): void {
-  io.log(`确认 ${actions.length} 个动作：`);
+function printPlan(manager: CliManager, actions: Action[], statuses: ToolStatus[]): void {
+  console.log(`确认 ${actions.length} 个动作：`);
   for (const action of actions) {
     const status = statuses.find((candidate) => candidate.id === action.toolId)!;
-    io.log(`  ${OPERATION_LABELS[action.operation]} ${status.label}：${manager.preview(action)}`);
+    console.log(`  ${OPERATION_LABELS[action.operation]} ${status.label}：${manager.preview(action)}`);
   }
   if (actions.some((action) => action.operation === "uninstall")) {
-    io.log("卸载只移除程序本身，保留各工具的用户数据目录。");
+    console.log("卸载只移除程序本身，保留各工具的用户数据目录。");
   }
 }
 
-function printResults(results: ActionResult[], io: CliIo): void {
-  io.log("完成：");
+function printResults(results: ActionResult[]): void {
+  console.log("完成：");
   for (const result of results) {
     if (result.outcome === "changed") {
       const change = result.operation === "uninstall"
@@ -62,11 +73,11 @@ function printResults(results: ActionResult[], io: CliIo): void {
         : result.beforeVersion
           ? `${result.beforeVersion} → ${result.afterVersion}`
           : `已安装 ${result.afterVersion}`;
-      io.log(`✓ ${result.label} ${change}`);
+      console.log(`✓ ${result.label} ${change}`);
     } else if (result.outcome === "failed") {
-      io.log(`✗ ${result.label} 失败：${result.message ?? "未知错误"}`);
+      console.log(`✗ ${result.label} 失败：${result.message ?? "未知错误"}`);
     } else {
-      io.log(`— ${result.label} ${result.message}`);
+      console.log(`— ${result.label} ${result.message}`);
     }
   }
 }
@@ -75,40 +86,46 @@ async function runPlanned(
   manager: CliManager,
   statuses: ToolStatus[],
   actions: Action[],
-  io: CliIo,
-  prompts: PromptAdapter,
 ): Promise<number> {
-  if (!io.isTTY) throw new Error("安装、更新和卸载需要真实终端，以便上游 CLI 正常交互。");
+  if (!isTTY) throw new Error("安装、更新和卸载需要真实终端，以便上游 CLI 正常交互。");
   if (actions.length === 0) {
-    io.log("没有可执行的操作。");
+    console.log("没有可执行的操作。");
     return 0;
   }
-  printPlan(manager, actions, statuses, io);
-  if (!(await prompts.confirm("确认执行以上操作？"))) {
-    io.log("已取消，未执行任何操作。");
+  printPlan(manager, actions, statuses);
+  if (!(await confirm({ message: "确认执行以上操作？", default: false }))) {
+    console.log("已取消，未执行任何操作。");
     return 0;
   }
-  const results = await manager.run(actions);
-  printResults(results, io);
+  const results = await manager.run(actions, { verifyLatest: true });
+  printResults(results);
   return results.some((result) => result.outcome === "failed") ? 1 : 0;
 }
 
-async function runInteractive(manager: CliManager, io: CliIo, prompts: PromptAdapter): Promise<number> {
-  if (!io.isTTY) throw new Error("交互模式需要真实终端；请使用 status、install、update 或 uninstall 子命令。");
-  const statuses = await manager.scan();
-  printSummary(statuses, io);
+async function runInteractive(manager: CliManager): Promise<number> {
+  if (!isTTY) throw new Error("交互模式需要真实终端；请使用 status、install、update 或 uninstall 子命令。");
+  const statuses = await manager.scan({ checkLatest: true });
+  printSummary(statuses);
   let intent: "install" | "update";
   while (true) {
-    const chosen = await prompts.chooseIntent({
-      canInstall: statuses.some((status) => status.state === "missing"),
-      canUpdate: statuses.some((status) => status.state !== "missing"),
+    const canInstall = statuses.some((status) => status.state === "missing");
+    const canUpdate = statuses.some((status) => status.state !== "missing");
+    const chosen = await select<Intent>({
+      message: "现在要做什么？",
+      choices: [
+        ...(canInstall ? [{ name: "安装缺失工具", value: "install" as const, description: "使用 catalog 中唯一的推荐入口" }] : []),
+        ...(canUpdate ? [{ name: "更新已安装工具", value: "update" as const, description: "把终端交给各 CLI updater" }] : []),
+        { name: "查看精确命令", value: "details" as const },
+        { name: "退出", value: "cancel" as const },
+      ],
+      loop: false,
     });
     if (chosen === "details") {
-      printDetails(statuses, io);
+      printDetails(manager, statuses);
       continue;
     }
     if (chosen === "cancel") {
-      io.log("已取消，未执行任何操作。");
+      console.log("已取消，未执行任何操作。");
       return 0;
     }
     intent = chosen;
@@ -117,26 +134,26 @@ async function runInteractive(manager: CliManager, io: CliIo, prompts: PromptAda
   const actions: Action[] = statuses
     .filter((status) => intent === "install" ? status.state === "missing" : status.state !== "missing")
     .map((status) => ({ toolId: status.id, operation: intent }));
-  return runPlanned(manager, statuses, actions, io, prompts);
+  return runPlanned(manager, statuses, actions);
 }
 
 function usage(): string {
   return `用法：
   ai-cli-manager
-  ai-cli-manager status
-  ai-cli-manager status --json
+  ai-cli-manager status [--local]
+  ai-cli-manager status --json [--local]
   ai-cli-manager install <tool...>
   ai-cli-manager update [tool...]
   ai-cli-manager uninstall <tool...>
 
 工具：claude、codex、kimi、pi、omp、mmx、grok
 
-扫描只读取 PATH 当前生效命令的本地版本；安装、更新和卸载执行前均会显示精确计划并确认。
+status 默认直接核验官网 latest，--local 只读取本地版本与路径；写操作执行前会显示精确计划并确认。
 卸载只移除程序本身，保留各工具的用户数据目录。`;
 }
 
-function printStatuses(statuses: ToolStatus[], io: CliIo): void {
-  for (const status of statuses) io.log(`${status.label.padEnd(12)} ${status.state === "missing" ? "未安装" : statusValue(status)}`);
+function printStatuses(statuses: ToolStatus[]): void {
+  for (const status of statuses) console.log(`${status.label.padEnd(12)} ${status.state === "missing" ? "未安装" : statusValue(status)}`);
 }
 
 function selectedStatuses(statuses: ToolStatus[], ids: string[]): ToolStatus[] {
@@ -150,24 +167,25 @@ function selectedStatuses(statuses: ToolStatus[], ids: string[]): ToolStatus[] {
 
 async function runCli(args: string[]): Promise<number> {
   const manager = createCliManager();
-  const io = defaultIo;
-  const prompts = inquirerPrompts;
-  if (args.length === 0) return runInteractive(manager, io, prompts);
+  if (args.length === 0) return runInteractive(manager);
   if (args[0] === "--help" || args[0] === "-h") {
     if (args.length !== 1) throw new Error("帮助选项不能与其他参数同时使用。");
-    io.log(usage());
+    console.log(usage());
     return 0;
   }
   if (args[0] === "--version" || args[0] === "-v") {
     if (args.length !== 1) throw new Error("版本选项不能与其他参数同时使用。");
-    io.log(VERSION);
+    console.log(VERSION);
     return 0;
   }
   if (args[0] === "status") {
-    if (args.length > 2 || (args[1] && args[1] !== "--json")) throw new Error("status 只支持 --json 选项。");
-    const statuses = await manager.scan();
-    if (args[1] === "--json") io.log(JSON.stringify(statuses, null, 2));
-    else printStatuses(statuses, io);
+    const options = args.slice(1);
+    if (new Set(options).size !== options.length || options.some((option) => option !== "--json" && option !== "--local")) {
+      throw new Error("status 只支持 --json 和 --local 选项。");
+    }
+    const statuses = await manager.scan({ checkLatest: !options.includes("--local") });
+    if (options.includes("--json")) console.log(JSON.stringify(statuses, null, 2));
+    else printStatuses(statuses);
     return 0;
   }
   if (args[0] === "install" || args[0] === "update" || args[0] === "uninstall") {
@@ -188,8 +206,6 @@ async function runCli(args: string[]): Promise<number> {
       manager,
       statuses,
       selected.map((status) => ({ toolId: status.id, operation })),
-      io,
-      prompts,
     );
   }
   throw new Error(`未知命令：${args[0]}`);
