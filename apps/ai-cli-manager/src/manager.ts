@@ -6,7 +6,6 @@ import { NodeCommandRunner } from "./runner.js";
 
 const SCRIPT_MAX_BYTES = 2 * 1024 * 1024;
 
-export type { ToolId } from "./catalog.js";
 export type InstallSource = "official" | "homebrew" | "npm" | "bun" | "pnpm" | "mise" | "unknown";
 export type UpdateState = "current" | "outdated" | "ahead" | "unavailable";
 export type ToolState = "missing" | "installed" | "unreadable";
@@ -42,7 +41,6 @@ export interface CommandResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
-  signal?: NodeJS.Signals;
   error?: string;
   errorCode?: string;
 }

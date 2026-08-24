@@ -107,14 +107,14 @@ export class NodeCommandRunner implements CommandRunner {
         timedOut = true;
         terminateTree(child, "SIGTERM");
         forceKillTimer = setTimeout(() => {
-          terminateTree(child, "SIGKILL", () => finish({ code: null, signal: "SIGKILL", stdout, stderr, timedOut }));
+          terminateTree(child, "SIGKILL", () => finish({ code: null, stdout, stderr, timedOut }));
         }, FORCE_KILL_GRACE_MS);
       }, timeoutMs);
       child.once("error", (error: NodeJS.ErrnoException) => {
         if (!timedOut) finish({ code: null, stdout, stderr, timedOut, error: error.message, errorCode: error.code });
       });
-      child.once("close", (code, signal) => {
-        if (!timedOut) finish({ code, signal: signal ?? undefined, stdout, stderr, timedOut });
+      child.once("close", (code) => {
+        if (!timedOut) finish({ code, stdout, stderr, timedOut });
       });
     });
   }
