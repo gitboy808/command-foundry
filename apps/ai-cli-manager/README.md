@@ -29,7 +29,7 @@ npm run build
 ## 命令
 
 ```bash
-ai-cli-manager                 # 交互模式：选择安装全部缺失工具或更新全部已安装工具
+ai-cli-manager                 # 交互模式：选择操作，再多选要处理的工具
 ai-cli-manager status          # 输出本地版本、安装来源和官网 latest 对比
 ai-cli-manager status --json   # 输出相同状态的 JSON
 ai-cli-manager status --local  # 只读本地状态，不访问网络
@@ -77,9 +77,12 @@ updater，也不受本机 npm registry 配置影响。`status --local` 完全跳
 | MiniMax CLI | `npm install -g mmx-cli` | `mmx update` |
 | Grok Build | 官方安装脚本 | `grok update` |
 
-所有安装和更新都要求 stdin 与 stdout 连接真实终端，并在执行前显示精确计划、等待确认。
-动作继承当前终端，因此 Kimi 等上游工具可以显示进度或继续询问。多个动作逐个串行执行；
-单项失败不会阻止后续动作。
+交互模式先选择安装、更新或卸载，再用复选框选择工具。安装和更新默认全选，卸载默认不选；
+取消全部选项会直接结束，不执行动作，`Esc` 或 `q` 返回操作菜单。光标停在选项上时显示
+精确命令，提交后仍会展示完整计划并等待默认 `No` 的确认。所有写操作都要求 stdin 与
+stdout 连接真实终端；卸载在普通确认后还会要求一次默认 `No` 的二次确认。动作继承当前
+终端，因此 Kimi 等上游工具可以显示进度或继续询问。多个动作逐个串行执行；单项失败不会
+阻止后续动作。
 
 官方安装器可能把新目录写入 shell profile，但无法修改已经运行的父进程环境。如果安装后
 提示无法重新读取版本，请按安装器提示刷新当前 shell 或打开新终端，再运行
@@ -94,8 +97,10 @@ Grok Build 的后台自动更新默认开启，日常使用 `grok` 本身就可�
 
 ### 卸载
 
-`uninstall` 必须显式列出工具名，不提供「全部卸载」。卸载步骤来自各工具官方文档记载的
-原生方式（调研见 [native-uninstall](./docs/research/native-uninstall.md)、
+`uninstall` 子命令必须显式列出工具名，不提供「全部卸载」。交互模式中的卸载清单默认
+不勾选任何工具；当前平台不支持的卸载项会禁用并说明原因。执行前经过两次默认 `No` 的
+确认。卸载步骤来自各工具官方文档记载的原生方式（调研见
+[native-uninstall](./docs/research/native-uninstall.md)、
 [minimax-cli](./docs/research/minimax-cli-install-and-update.md) 与
 [grok-build](./docs/research/grok-build-install-and-update.md) 研究）：
 

@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 const appRoot = path.resolve(import.meta.dirname, "..");
 const sourceEntry = path.join(appRoot, "src", "cli.ts");
+const latestFixture = path.join(import.meta.dirname, "fixtures", "mock-latest.mjs");
+const win32Fixture = path.join(import.meta.dirname, "fixtures", "mock-win32.mjs");
+const skipInteractive = !existsSync("/usr/bin/expect");
 
 function execute(args: string[], entry = sourceEntry, env: NodeJS.ProcessEnv = process.env) {
   return spawnSync(process.execPath, ["--import", "tsx", entry, ...args], {
@@ -27,6 +31,162 @@ async function writeCommand(directory: string, name: string, output: string): Pr
   const command = path.join(directory, name);
   await writeFile(command, `#!${process.execPath}\nconsole.log(${JSON.stringify(output)});\n`);
   await chmod(command, 0o755);
+}
+
+async function writeManagedCommand(directory: string, name: string, version: string): Promise<void> {
+  const command = path.join(directory, name);
+  await writeFile(command, `#!${process.execPath}\nif (process.argv.includes("--version")) {\n  console.log(${JSON.stringify(version)});\n} else {\n  require("node:fs").appendFileSync(process.env.ACTION_LOG, ${JSON.stringify(`${name} `)} + process.argv.slice(2).join(" ") + "\\n");\n}\n`);
+  await chmod(command, 0o755);
+}
+
+async function withManagedCommands(
+  commands: Record<string, string>,
+  run: (directory: string, actionLog: string) => Promise<void>,
+): Promise<void> {
+  const directory = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-interactive-"));
+  try {
+    await Promise.all(Object.entries(commands).map(([name, version]) => writeManagedCommand(directory, name, version)));
+    await run(directory, path.join(directory, "actions.log"));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+function executeInteractive(
+  env: NodeJS.ProcessEnv,
+  interactions: Array<{ waitFor: string; send?: string }>,
+) {
+  const steps = interactions.map(({ waitFor, send }) => [
+    `await {${waitFor}}`,
+    ...(send ? [`send -- [binary format H* ${Buffer.from(send).toString("hex")}]`] : []),
+  ].join("\n")).join("\n");
+  const script = `
+set timeout 5
+proc await {value} {
+  expect {
+    -glob "*$value*" {}
+    timeout { exit 124 }
+    eof { exit 125 }
+  }
+}
+spawn -noecho $env(TEST_NODE) --import tsx --import $env(TEST_LATEST_FIXTURE) $env(TEST_ENTRY)
+${steps}
+expect eof
+catch wait result
+exit [lindex $result 3]
+`;
+  return spawnSync("/usr/bin/expect", ["-c", script], {
+    cwd: appRoot,
+    encoding: "utf8",
+    env: {
+      ...env,
+      TEST_ENTRY: sourceEntry,
+      TEST_LATEST_FIXTURE: env.TEST_LATEST_FIXTURE ?? latestFixture,
+      TEST_NODE: process.execPath,
+    },
+  });
+}
+
+test("交互更新默认全选并允许取消部分工具", { skip: skipInteractive }, async () => {
+  await withManagedCommands({ codex: "codex-cli 0.149.1", pi: "pi 0.84.2" }, async (directory, actionLog) => {
+    const result = executeInteractive({
+      ...process.env,
+      ACTION_LOG: actionLog,
+      PATH: directory,
+    }, [
+      { waitFor: "现在要做什么？", send: "\x1b[B\r" },
+      { waitFor: "选择要更新的工具", send: " \x1b[B\r" },
+      { waitFor: "确认执行以上操作？", send: "y\r" },
+    ]);
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(await readFile(actionLog, "utf8"), "pi update --self\n");
+  });
+});
+
+test("交互卸载默认不选择任何工具", { skip: skipInteractive }, async () => {
+  await withManagedCommands({ codex: "codex-cli 0.149.1" }, async (directory, actionLog) => {
+    const result = executeInteractive({
+      ...process.env,
+      ACTION_LOG: actionLog,
+      PATH: directory,
+    }, [
+      { waitFor: "现在要做什么？", send: "\x1b[B\x1b[B\r" },
+      { waitFor: "选择要卸载的工具", send: "\r" },
+      { waitFor: "没有可执行的操作。" },
+    ]);
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    await assert.rejects(readFile(actionLog, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("卸载计划执行前需要二次确认", { skip: skipInteractive }, async () => {
+  await withManagedCommands({ pi: "pi 0.84.2" }, async (directory, actionLog) => {
+    const result = executeInteractive({
+      ...process.env,
+      ACTION_LOG: actionLog,
+      PATH: directory,
+    }, [
+      { waitFor: "现在要做什么？", send: "\x1b[B\x1b[B\r" },
+      { waitFor: "选择要卸载的工具", send: " \r" },
+      { waitFor: "确认执行以上操作？", send: "y\r" },
+      { waitFor: "再次确认卸载", send: "\r" },
+      { waitFor: "已取消，未执行任何操作。" },
+    ]);
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    await assert.rejects(readFile(actionLog, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("交互卸载不会让当前平台不支持的工具崩溃", { skip: skipInteractive }, async () => {
+  await withManagedCommands({ codex: "codex-cli 0.149.1" }, async (directory) => {
+    const result = executeInteractive({
+      ...process.env,
+      PATH: directory,
+      PATHEXT: ".EXE",
+      TEST_LATEST_FIXTURE: win32Fixture,
+    }, [
+      { waitFor: "现在要做什么？", send: "\x1b[B\x1b[B\r" },
+      { waitFor: "Codex 不支持当前平台的卸载方式", send: "\r" },
+      { waitFor: "没有可执行的操作。" },
+    ]);
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  });
+});
+
+test("交互安装明确显示未安装状态", { skip: skipInteractive }, async () => {
+  await withManagedCommands({}, async (directory) => {
+    const result = executeInteractive({ ...process.env, PATH: directory }, [
+      { waitFor: "现在要做什么？", send: "\r" },
+      { waitFor: "Claude Code 未安装", send: "i\r" },
+      { waitFor: "没有可执行的操作。" },
+    ]);
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  });
+});
+
+for (const [keyName, key] of [["Esc", "\x1b"], ["q", "q"]] as const) {
+  test(`交互工具选择支持 ${keyName} 返回操作菜单`, { skip: skipInteractive }, async () => {
+    await withManagedCommands({ codex: "codex-cli 0.149.1" }, async (directory, actionLog) => {
+      const result = executeInteractive({
+        ...process.env,
+        ACTION_LOG: actionLog,
+        PATH: directory,
+      }, [
+        { waitFor: "现在要做什么？", send: "\x1b[B\r" },
+        { waitFor: "esc/q 返回", send: key },
+        { waitFor: "现在要做什么？", send: "\x1b[B\x1b[B\x1b[B\r" },
+        { waitFor: "已取消，未执行任何操作。" },
+      ]);
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      await assert.rejects(readFile(actionLog, "utf8"), { code: "ENOENT" });
+    });
+  });
 }
 
 test("通过 npm 风格的符号链接启动 CLI", { skip: process.platform === "win32" }, async () => {

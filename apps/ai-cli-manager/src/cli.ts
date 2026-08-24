@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { confirm, select } from "@inquirer/prompts";
+import { checkbox, confirm, select } from "@inquirer/prompts";
 import {
   createCliManager,
   type Action,
@@ -10,7 +10,6 @@ import {
 } from "./manager.js";
 
 const VERSION = "0.1.0";
-type Intent = "install" | "update" | "details" | "cancel";
 const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 
 const SOURCE_LABELS: Record<InstallSource, string> = {
@@ -24,27 +23,13 @@ const SOURCE_LABELS: Record<InstallSource, string> = {
 };
 
 function statusValue(status: ToolStatus): string {
-  const value = status.version ?? (status.state === "unreadable" ? "版本不可读" : "—");
+  const value = status.version ?? (status.state === "unreadable" ? "版本不可读" : "未安装");
   const update = status.updateState === "current" ? "官网最新版"
     : status.updateState === "outdated" ? `可更新至 ${status.latestVersion}`
       : status.updateState === "ahead" ? `高于官网 ${status.latestVersion}`
         : status.updateState === "unavailable" ? "官网版本不可用"
           : undefined;
   return [value, status.source ? SOURCE_LABELS[status.source] : undefined, update].filter(Boolean).join(" · ");
-}
-
-function printSummary(statuses: ToolStatus[]): void {
-  const missing = statuses.filter((status) => status.state === "missing").length;
-  console.log(`${statuses.length - missing} 已安装 · ${missing} 未安装`);
-  console.log(statuses.map((status) => `${status.label} ${statusValue(status)}`).join(" · "));
-}
-
-function printDetails(manager: CliManager, statuses: ToolStatus[]): void {
-  console.log("精确命令：");
-  for (const status of statuses) console.log(`  ${status.label}：${manager.preview({
-    toolId: status.id,
-    operation: status.state === "missing" ? "install" : "update",
-  })}`);
 }
 
 const OPERATION_LABELS: Record<Action["operation"], string> = {
@@ -82,6 +67,41 @@ function printResults(results: ActionResult[]): void {
   }
 }
 
+async function chooseActions(
+  manager: CliManager,
+  statuses: ToolStatus[],
+  operation: Action["operation"],
+): Promise<Action[] | undefined> {
+  const controller = new AbortController();
+  const goBack = (_input: string, key: { name?: string }): void => {
+    if (key.name === "escape" || key.name === "q") controller.abort();
+  };
+  process.stdin.on("keypress", goBack);
+  try {
+    const selectedIds = await checkbox<Action["toolId"]>({
+      message: `选择要${OPERATION_LABELS[operation]}的工具`,
+      choices: statuses
+        .filter((status) => operation === "install" ? status.state === "missing" : status.state !== "missing")
+        .map((status) => {
+          const action: Action = { toolId: status.id, operation };
+          try {
+            return { name: `${status.label} ${statusValue(status)}`, value: status.id, checked: operation !== "uninstall", description: manager.preview(action) };
+          } catch (error: unknown) {
+            return { name: `${status.label} ${statusValue(status)}`, value: status.id, disabled: (error as Error).message };
+          }
+        }),
+      loop: false,
+      theme: { style: { keysHelpTip: () => "↑↓ 移动 • space 选择 • a 全选 • i 反选 • esc/q 返回 • ⏎ 提交" } },
+    }, { signal: controller.signal });
+    return selectedIds.map((toolId) => ({ toolId, operation }));
+  } catch (error: unknown) {
+    if ((error as Error).name === "AbortPromptError") return undefined;
+    throw error;
+  } finally {
+    process.stdin.off("keypress", goBack);
+  }
+}
+
 async function runPlanned(
   manager: CliManager,
   statuses: ToolStatus[],
@@ -97,6 +117,14 @@ async function runPlanned(
     console.log("已取消，未执行任何操作。");
     return 0;
   }
+  const uninstallCount = actions.filter((action) => action.operation === "uninstall").length;
+  if (uninstallCount > 0 && !(await confirm({
+    message: `再次确认卸载 ${uninstallCount} 个工具？`,
+    default: false,
+  }))) {
+    console.log("已取消，未执行任何操作。");
+    return 0;
+  }
   const results = await manager.run(actions, { verifyLatest: true });
   printResults(results);
   return results.some((result) => result.outcome === "failed") ? 1 : 0;
@@ -105,36 +133,28 @@ async function runPlanned(
 async function runInteractive(manager: CliManager): Promise<number> {
   if (!isTTY) throw new Error("交互模式需要真实终端；请使用 status、install、update 或 uninstall 子命令。");
   const statuses = await manager.scan({ checkLatest: true });
-  printSummary(statuses);
-  let intent: "install" | "update";
+  const missingCount = statuses.filter((status) => status.state === "missing").length;
+  console.log(`${statuses.length - missingCount} 已安装 · ${missingCount} 未安装`);
+  const canInstall = statuses.some((status) => status.state === "missing");
+  const canManage = statuses.some((status) => status.state !== "missing");
   while (true) {
-    const canInstall = statuses.some((status) => status.state === "missing");
-    const canUpdate = statuses.some((status) => status.state !== "missing");
-    const chosen = await select<Intent>({
+    const operation = await select<Action["operation"] | "cancel">({
       message: "现在要做什么？",
       choices: [
         ...(canInstall ? [{ name: "安装缺失工具", value: "install" as const, description: "使用 catalog 中唯一的推荐入口" }] : []),
-        ...(canUpdate ? [{ name: "更新已安装工具", value: "update" as const, description: "把终端交给各 CLI updater" }] : []),
-        { name: "查看精确命令", value: "details" as const },
+        ...(canManage ? [{ name: "更新已安装工具", value: "update" as const, description: "把终端交给各 CLI updater" }] : []),
+        ...(canManage ? [{ name: "卸载已安装工具", value: "uninstall" as const, description: "仅移除程序，保留用户数据" }] : []),
         { name: "退出", value: "cancel" as const },
       ],
       loop: false,
     });
-    if (chosen === "details") {
-      printDetails(manager, statuses);
-      continue;
-    }
-    if (chosen === "cancel") {
+    if (operation === "cancel") {
       console.log("已取消，未执行任何操作。");
       return 0;
     }
-    intent = chosen;
-    break;
+    const actions = await chooseActions(manager, statuses, operation);
+    if (actions) return runPlanned(manager, statuses, actions);
   }
-  const actions: Action[] = statuses
-    .filter((status) => intent === "install" ? status.state === "missing" : status.state !== "missing")
-    .map((status) => ({ toolId: status.id, operation: intent }));
-  return runPlanned(manager, statuses, actions);
 }
 
 function usage(): string {
