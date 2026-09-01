@@ -87,20 +87,37 @@ exit [lindex $result 3]
   });
 }
 
-test("交互更新默认全选并允许取消部分工具", { skip: skipInteractive }, async () => {
-  await withManagedCommands({ codex: "codex-cli 0.149.1", pi: "pi 0.84.2" }, async (directory, actionLog) => {
+test("交互更新默认跳过已确认是最新版的工具", { skip: skipInteractive }, async () => {
+  await withManagedCommands({ codex: "codex-cli 0.148.0", pi: "pi 0.84.2" }, async (directory, actionLog) => {
     const result = executeInteractive({
       ...process.env,
       ACTION_LOG: actionLog,
       PATH: directory,
     }, [
       { waitFor: "现在要做什么？", send: "\x1b[B\r" },
-      { waitFor: "选择要更新的工具", send: " \x1b[B\r" },
+      { waitFor: "选择要更新的工具", send: "\r" },
       { waitFor: "确认执行以上操作？", send: "y\r" },
     ]);
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.equal(await readFile(actionLog, "utf8"), "pi update --self\n");
+    assert.equal(await readFile(actionLog, "utf8"), "codex update\n");
+  });
+});
+
+test("交互更新默认将 Claude Code 排在其他工具之后", { skip: skipInteractive }, async () => {
+  await withManagedCommands({ claude: "0.0.1 (Claude Code)", codex: "codex-cli 0.148.0" }, async (directory, actionLog) => {
+    const result = executeInteractive({
+      ...process.env,
+      ACTION_LOG: actionLog,
+      PATH: directory,
+    }, [
+      { waitFor: "现在要做什么？", send: "\x1b[B\r" },
+      { waitFor: "选择要更新的工具", send: "\r" },
+      { waitFor: "确认执行以上操作？", send: "y\r" },
+    ]);
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(await readFile(actionLog, "utf8"), "codex update\nclaude update\n");
   });
 });
 
@@ -197,7 +214,7 @@ test("通过 npm 风格的符号链接启动 CLI", { skip: process.platform === 
   try {
     const result = execute(["--version"], entry);
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), "0.1.0");
+    assert.equal(result.stdout.trim(), "0.1.1");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

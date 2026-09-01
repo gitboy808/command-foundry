@@ -55,6 +55,7 @@ CLI 和测试只跨 `manager` seam：
 ```ts
 interface CliManager {
   scan(options?: { checkLatest?: boolean }): Promise<ToolStatus[]>;
+  actionCandidates(statuses: ToolStatus[], operation: Operation): ToolStatus[];
   preview(action: Action): string;
   run(actions: Action[], options?: { verifyLatest?: boolean }): Promise<ActionResult[]>;
 }
@@ -75,7 +76,7 @@ interface ToolStatus {
 
 ```mermaid
 flowchart LR
-  CLI["CLI / 极简交互"] -->|"scan(), run(actions)"| Manager["manager 深模块"]
+  CLI["CLI / 极简交互"] -->|"scan(), actionCandidates(), run(actions)"| Manager["manager 深模块"]
   Manager --> Catalog["各工具的静态 recipe"]
   Manager --> Runner["capture 扫描 / inherit 动作"]
   Manager --> Latest["官网 latest HTTPS"]
@@ -89,8 +90,9 @@ Claude 直连保留为内部特例；出现第二种专用行为前不抽象 ada
 
 ## 交互
 
-先选意图，再选择合法工具；安装和更新默认全选，卸载默认不选。提交后展示计划并确认，
-卸载二次确认；空选退出，`Esc/q` 返回。动作继承终端。
+先选意图，再选择合法工具；安装默认全选，更新默认跳过已确认是官网最新版的工具并将
+Claude Code 排在最后，卸载默认不选。提交后展示计划并确认，卸载二次确认；空选退出，
+`Esc/q` 返回。动作继承终端。
 
 ## 实现约束
 

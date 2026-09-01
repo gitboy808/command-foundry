@@ -14,7 +14,7 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { CATALOG, type ActionStep, type ToolId, type ToolRecipe } from "./catalog.js";
+import { CATALOG, compareUpdateOrder, type ActionStep, type ToolId, type ToolRecipe } from "./catalog.js";
 import { NodeCommandRunner } from "./runner.js";
 
 const SCRIPT_MAX_BYTES = 2 * 1024 * 1024;
@@ -74,6 +74,7 @@ export interface CommandRunner {
 
 export interface CliManager {
   scan(options?: { checkLatest?: boolean }): Promise<ToolStatus[]>;
+  actionCandidates(statuses: ToolStatus[], operation: Operation): ToolStatus[];
   preview(action: Action): string;
   run(actions: Action[], options?: { verifyLatest?: boolean }): Promise<ActionResult[]>;
 }
@@ -111,6 +112,13 @@ function unchangedMessage(status: ToolStatus): string {
       : status.updateState === "ahead" ? `本地版本高于官网最新版 ${status.latestVersion}。`
         : status.updateState === "unavailable" ? "版本无变化，无法核验官网最新版。"
           : "版本无变化（未核验官网最新版，或上游给出了手动步骤）。";
+}
+
+function actionCandidates(statuses: ToolStatus[], operation: Operation): ToolStatus[] {
+  const candidates = statuses
+    .filter((status) => operation === "install" ? status.state === "missing" : status.state !== "missing");
+  if (operation === "update") candidates.sort((left, right) => compareUpdateOrder(left.id, right.id));
+  return candidates;
 }
 
 async function commandPaths(
@@ -577,6 +585,7 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
 
   return {
     scan: ({ checkLatest = false } = {}) => Promise.all(CATALOG.map((tool) => scanTool(tool, checkLatest))),
+    actionCandidates,
     preview: (action) => {
       const tool = CATALOG.find((candidate) => candidate.id === action.toolId);
       if (!tool) throw new Error(`未知工具：${action.toolId}`);

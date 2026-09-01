@@ -9,7 +9,7 @@ import {
   type ToolStatus,
 } from "./manager.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 
 const SOURCE_LABELS: Record<InstallSource, string> = {
@@ -73,6 +73,7 @@ async function chooseActions(
   operation: Action["operation"],
 ): Promise<Action[] | undefined> {
   const controller = new AbortController();
+  const eligibleStatuses = manager.actionCandidates(statuses, operation);
   const goBack = (_input: string, key: { name?: string }): void => {
     if (key.name === "escape" || key.name === "q") controller.abort();
   };
@@ -80,12 +81,16 @@ async function chooseActions(
   try {
     const selectedIds = await checkbox<Action["toolId"]>({
       message: `选择要${OPERATION_LABELS[operation]}的工具`,
-      choices: statuses
-        .filter((status) => operation === "install" ? status.state === "missing" : status.state !== "missing")
+      choices: eligibleStatuses
         .map((status) => {
           const action: Action = { toolId: status.id, operation };
           try {
-            return { name: `${status.label} ${statusValue(status)}`, value: status.id, checked: operation !== "uninstall", description: manager.preview(action) };
+            return {
+              name: `${status.label} ${statusValue(status)}`,
+              value: status.id,
+              checked: operation !== "uninstall" && (operation !== "update" || status.updateState !== "current"),
+              description: manager.preview(action),
+            };
           } catch (error: unknown) {
             return { name: `${status.label} ${statusValue(status)}`, value: status.id, disabled: (error as Error).message };
           }

@@ -6,6 +6,7 @@ export interface RecipeShape {
   readonly id: string;
   readonly label: string;
   readonly latest: { readonly url: string; readonly field?: "version" | "tag_name" };
+  readonly updateOrder?: "last";
   readonly officialPathHints?: readonly string[];
   readonly install: { readonly unix: ActionStep; readonly win32?: ActionStep };
   readonly updateArgs?: readonly string[];
@@ -26,6 +27,7 @@ export const CATALOG = [
     id: "claude",
     label: "Claude Code",
     latest: { url: "https://downloads.claude.ai/claude-code-releases/latest" },
+    updateOrder: "last",
     officialPathHints: ["/.local/share/claude/", "/.local/bin/claude"],
     install: {
       unix: script("https://claude.ai/install.sh", ["claude.ai", "downloads.claude.ai"], "bash"),
@@ -122,3 +124,11 @@ export const CATALOG = [
 
 export type ToolId = typeof CATALOG[number]["id"];
 export type ToolRecipe = RecipeShape & { readonly id: ToolId };
+
+export function compareUpdateOrder(left: ToolId, right: ToolId): number {
+  const rank = (id: ToolId): number => {
+    const tool: RecipeShape | undefined = CATALOG.find((candidate) => candidate.id === id);
+    return tool?.updateOrder === "last" ? 1 : 0;
+  };
+  return rank(left) - rank(right);
+}
