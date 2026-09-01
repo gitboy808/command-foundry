@@ -1,10 +1,26 @@
-import { access, constants, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  access,
+  chmod,
+  constants,
+  mkdtemp,
+  open,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { CATALOG, type ActionStep, type ToolId, type ToolRecipe } from "./catalog.js";
 import { NodeCommandRunner } from "./runner.js";
 
 const SCRIPT_MAX_BYTES = 2 * 1024 * 1024;
+const METADATA_MAX_BYTES = 1024 * 1024;
+const CLAUDE_RELEASES_URL = "https://downloads.claude.ai/claude-code-releases";
+const DEFAULT_DOWNLOAD_STALL_MS = 30_000;
 
 export type InstallSource = "official" | "homebrew" | "npm" | "bun" | "pnpm" | "mise" | "unknown";
 export type UpdateState = "current" | "outdated" | "ahead" | "unavailable";
@@ -65,9 +81,11 @@ export interface CliManager {
 export interface ManagerOptions {
   runner?: CommandRunner;
   platform?: NodeJS.Platform;
+  arch?: NodeJS.Architecture;
   env?: NodeJS.ProcessEnv;
   fetch?: typeof fetch;
   actionTimeoutMs?: number;
+  downloadStallMs?: number;
 }
 
 function extractVersion(value: string): string | undefined {
@@ -149,17 +167,140 @@ function describeStep(step: ActionStep): string {
   return [step.program, ...step.args].map(quote).join(" ");
 }
 
+// Claude 直连更新是唯一专用路径，catalog 保持通用。
+function supportsClaudeDirectUpdate(tool: ToolRecipe, operation: Operation, platform: NodeJS.Platform): boolean {
+  return tool.id === "claude"
+    && operation === "update"
+    && (platform === "darwin" || platform === "linux");
+}
+
 function expandHome(value: string, env: NodeJS.ProcessEnv): string {
   if (value !== "~" && !value.startsWith("~/")) return value;
   return path.join(env.HOME ?? homedir(), value.slice(1));
 }
 
-function isAllowedScriptUrl(url: string, allowedHosts: readonly string[]): boolean {
+function isAllowedHttpsUrl(url: string, allowedHosts: readonly string[]): boolean {
   try {
     const parsed = new URL(url);
     return parsed.protocol === "https:" && allowedHosts.includes(parsed.hostname);
   } catch {
     return false;
+  }
+}
+
+function isInsideDirectory(directory: string, candidate: string): boolean {
+  const relative = path.relative(directory, candidate);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+async function claudePlatformKey(platform: NodeJS.Platform, arch: NodeJS.Architecture): Promise<string> {
+  if (platform === "darwin" && (arch === "arm64" || arch === "x64")) return `darwin-${arch}`;
+  if (platform === "linux" && (arch === "arm64" || arch === "x64")) {
+    const muslLoader = `/lib/ld-musl-${arch === "arm64" ? "aarch64" : "x86_64"}.so.1`;
+    const musl = await access(muslLoader).then(() => true, () => false);
+    return `linux-${arch}${musl ? "-musl" : ""}`;
+  }
+  throw new Error(`不支持的系统或 CPU 架构：${platform}/${arch}`);
+}
+
+function parseClaudeAsset(manifest: unknown, platformKey: string) {
+  const entry = (manifest as { platforms?: Record<string, Record<string, unknown>> })?.platforms?.[platformKey];
+  const checksum = entry?.checksum;
+  const size = entry?.size;
+  if (!entry || typeof checksum !== "string" || !/^[0-9a-f]{64}$/.test(checksum)
+    || typeof size !== "number" || !Number.isSafeInteger(size) || size <= 0) {
+    throw new Error(`官方发布清单不包含当前平台（${platformKey}）或清单格式异常。`);
+  }
+  const binary = entry.binary;
+  return {
+    binary: typeof binary === "string" && /^[A-Za-z0-9._-]+$/.test(binary) ? binary : "claude",
+    checksum,
+    size,
+  };
+}
+
+function formatMb(bytes: number): string {
+  return (bytes / 1024 / 1024).toFixed(1);
+}
+
+function createProgressPrinter(total: number): { tick: (downloaded: number) => void; finish: () => void } {
+  if (!process.stdout.isTTY) return { tick: () => {}, finish: () => {} };
+  let lastWrite = 0;
+  let wrote = false;
+  return {
+    tick(downloaded) {
+      const now = Date.now();
+      if (now - lastWrite < 100 && downloaded !== total) return;
+      lastWrite = now;
+      wrote = true;
+      const percent = Math.min(100, Math.floor((downloaded / total) * 100));
+      process.stdout.write(`\r下载中 ${formatMb(downloaded)}/${formatMb(total)} MB（${percent}%）  `);
+    },
+    finish() {
+      if (wrote) process.stdout.write("\n");
+    },
+  };
+}
+
+// 同时限制单次停滞和整体下载时间。
+async function downloadWithIntegrity(
+  fetchImpl: typeof fetch,
+  url: string,
+  destination: string,
+  expectedSize: number,
+  stallMs: number,
+  overallMs: number,
+  onProgress: (downloaded: number) => void,
+): Promise<string> {
+  const controller = new AbortController();
+  const overall = setTimeout(() => controller.abort(), overallMs);
+  const stallText = stallMs % 1000 === 0 ? `${stallMs / 1000} 秒` : `${stallMs} 毫秒`;
+  let handle: FileHandle | undefined;
+  try {
+    const response = await fetchImpl(url, { signal: controller.signal, headers: { "cache-control": "no-cache" } });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.body) throw new Error("响应没有数据流。");
+    const reader = response.body.getReader();
+    const hash = createHash("sha256");
+    let downloaded = 0;
+    handle = await open(destination, "wx");
+    try {
+      while (true) {
+        const pending = reader.read();
+        pending.catch(() => {});
+        let stallTimer: NodeJS.Timeout | undefined;
+        const chunk = await Promise.race([
+          pending,
+          new Promise<never>((_, reject) => {
+            stallTimer = setTimeout(
+              () => reject(new Error(`下载停滞：超过 ${stallText} 没有收到数据`)),
+              stallMs,
+            );
+          }),
+        ]).finally(() => clearTimeout(stallTimer));
+        if (chunk.done) break;
+        downloaded += chunk.value.byteLength;
+        if (downloaded > expectedSize) {
+          throw new Error(`下载超过发布清单大小：应为 ${expectedSize} 字节`);
+        }
+        hash.update(chunk.value);
+        onProgress(downloaded);
+        await handle.write(chunk.value);
+      }
+    } catch (error: unknown) {
+      controller.abort();
+      await reader.cancel().catch(() => {});
+      throw error;
+    }
+    await handle.close();
+    handle = undefined;
+    if (downloaded !== expectedSize) {
+      throw new Error(`下载不完整：应为 ${expectedSize} 字节，实际 ${downloaded} 字节`);
+    }
+    return hash.digest("hex");
+  } finally {
+    clearTimeout(overall);
+    if (handle) await handle.close().catch(() => {});
   }
 }
 
@@ -194,16 +335,18 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;
   const runner = options.runner ?? new NodeCommandRunner();
+  const fetchImpl = options.fetch ?? fetch;
+  const actionTimeoutMs = options.actionTimeoutMs ?? 10 * 60_000;
 
   const readLatest = async (tool: ToolRecipe): Promise<string | undefined> => {
     try {
-      const response = await (options.fetch ?? fetch)(tool.latest.url, {
+      const response = await fetchImpl(tool.latest.url, {
         signal: AbortSignal.timeout(5_000),
         headers: { accept: "application/json,text/plain", "cache-control": "no-cache" },
       });
       if (!response.ok) return undefined;
       const body = await response.text();
-      if (body.length > 1024 * 1024) return undefined;
+      if (Buffer.byteLength(body) > METADATA_MAX_BYTES) return undefined;
       const value = tool.latest.field
         ? (JSON.parse(body) as Record<string, unknown>)[tool.latest.field]
         : body;
@@ -252,7 +395,7 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
   });
 
   const runScript = async (step: Extract<ActionStep, { kind: "script" }>): Promise<CommandResult> => {
-    if (!isAllowedScriptUrl(step.url, step.allowedHosts)) throw new Error(`拒绝执行未列入白名单的脚本：${step.url}`);
+    if (!isAllowedHttpsUrl(step.url, step.allowedHosts)) throw new Error(`拒绝执行未列入白名单的脚本：${step.url}`);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15_000);
     let body: Buffer;
@@ -260,18 +403,18 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
       let currentUrl = step.url;
       let response: Response | undefined;
       for (let redirects = 0; redirects <= 5; redirects += 1) {
-        response = await (options.fetch ?? fetch)(currentUrl, { redirect: "manual", signal: controller.signal });
+        response = await fetchImpl(currentUrl, { redirect: "manual", signal: controller.signal });
         if (![301, 302, 303, 307, 308].includes(response.status)) break;
         const location = response.headers.get("location");
         if (!location) throw new Error("官方安装脚本返回了无效重定向。");
         const nextUrl = new URL(location, currentUrl).toString();
-        if (!isAllowedScriptUrl(nextUrl, step.allowedHosts)) {
+        if (!isAllowedHttpsUrl(nextUrl, step.allowedHosts)) {
           throw new Error("官方安装脚本重定向到了不受信任的域名。");
         }
         currentUrl = nextUrl;
       }
       if (!response || [301, 302, 303, 307, 308].includes(response.status)) throw new Error("官方安装脚本重定向次数过多。");
-      if (!isAllowedScriptUrl(response.url || currentUrl, step.allowedHosts)) throw new Error("官方安装脚本重定向到了不受信任的域名。");
+      if (!isAllowedHttpsUrl(response.url || currentUrl, step.allowedHosts)) throw new Error("官方安装脚本重定向到了不受信任的域名。");
       if (!response.ok) throw new Error(`下载官方安装脚本失败：HTTP ${response.status}`);
       body = await readLimitedBody(response);
     } finally {
@@ -289,21 +432,94 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
       return await runner.run(step.shell, args, {
         stdio: "inherit",
         env,
-        timeoutMs: options.actionTimeoutMs ?? 10 * 60_000,
+        timeoutMs: actionTimeoutMs,
       });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
   };
 
+  // 标准 native Claude 绕过会停滞的内置下载器，直接校验并切换官方制品。
+  const runClaudeNativeUpdate = async (tool: ToolRecipe, before: ToolStatus): Promise<CommandResult> => {
+    const failure = (message: string): CommandResult => ({ code: 1, stdout: "", stderr: "", timedOut: false, error: message });
+    const versionsDir = path.join(env.HOME ?? homedir(), ".local", "share", "claude", "versions");
+    const paths = await commandPaths(tool.id, env, platform);
+    if (!paths) return failure("PATH 中找不到 claude 命令。");
+    const [launcher, resolved] = paths;
+    const versionsDirReal = await realpath(versionsDir).catch(() => versionsDir);
+    if (launcher === resolved || !isInsideDirectory(versionsDirReal, resolved)) {
+      return failure(`当前 claude 实际指向 ${resolved}，不在 ${versionsDir} 下，属于非标准安装，已停止直连更新；可先执行 claude install latest 修复为标准 native 安装。`);
+    }
+    const latest = await readLatest(tool);
+    if (!latest) return failure("无法获取官网最新版本，请检查网络后重试。");
+    if (before.version && compareVersions(before.version, latest) >= 0) {
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    }
+    const platformKey = await claudePlatformKey(platform, options.arch ?? process.arch);
+    const manifestUrl = `${CLAUDE_RELEASES_URL}/${latest}/manifest.json`;
+    let manifest: unknown;
+    try {
+      const response = await fetchImpl(manifestUrl, { signal: AbortSignal.timeout(15_000) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!isAllowedHttpsUrl(response.url || manifestUrl, ["downloads.claude.ai"])) {
+        return failure("官方发布清单重定向到了不受信任的域名。");
+      }
+      const body = await response.text();
+      if (Buffer.byteLength(body) > METADATA_MAX_BYTES) throw new Error("发布清单超过允许的大小。");
+      manifest = JSON.parse(body);
+    } catch {
+      return failure(`无法获取 ${latest} 的官方发布清单，请检查网络后重试。`);
+    }
+    const asset = parseClaudeAsset(manifest, platformKey);
+    const showProgress = Boolean(process.stdout.isTTY);
+    if (showProgress) console.log(`下载 Claude Code ${latest}（${platformKey}，${formatMb(asset.size)} MB）…`);
+    const targetPath = path.join(versionsDir, latest);
+    // 唯一临时目录确保 finally 不会误删其他进程的文件。
+    const temporaryDirectory = await mkdtemp(path.join(versionsDir, ".ai-cli-manager-"));
+    const temporary = path.join(temporaryDirectory, "claude");
+    let temporaryLinkDirectory: string | undefined;
+    const binaryUrl = `${CLAUDE_RELEASES_URL}/${latest}/${platformKey}/${asset.binary}`;
+    const stallMs = options.downloadStallMs ?? DEFAULT_DOWNLOAD_STALL_MS;
+    try {
+      const progress = createProgressPrinter(asset.size);
+      let digest: string;
+      try {
+        digest = await downloadWithIntegrity(fetchImpl, binaryUrl, temporary, asset.size, stallMs, actionTimeoutMs, progress.tick);
+      } catch (error: unknown) {
+        return failure(`下载官方二进制失败：${(error as Error).message}`);
+      } finally {
+        progress.finish();
+      }
+      if (digest !== asset.checksum) {
+        return failure("下载官方二进制失败：SHA-256 校验失败，下载内容与官方清单不一致。");
+      }
+      await chmod(temporary, 0o755);
+      await rename(temporary, targetPath);
+      // 临时软链必须与 launcher 位于同一文件系统，才能使用原子 rename。
+      temporaryLinkDirectory = await mkdtemp(path.join(path.dirname(launcher), ".ai-cli-manager-"));
+      const temporaryLink = path.join(temporaryLinkDirectory, "claude");
+      await symlink(targetPath, temporaryLink);
+      await rename(temporaryLink, launcher);
+      if (showProgress) console.log(`校验通过，已切换 ${launcher} → ${targetPath}。`);
+      return { code: 0, stdout: "", stderr: "", timedOut: false };
+    } catch (error: unknown) {
+      return failure(`安装 ${latest} 失败：${(error as Error).message}`);
+    } finally {
+      if (temporaryLinkDirectory) {
+        await rm(temporaryLinkDirectory, { recursive: true, force: true }).catch(() => {});
+      }
+      await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
+    }
+  };
+
   const runStep = (step: ActionStep): Promise<CommandResult> =>
-    step.kind === "command"
-      ? runner.run(step.program, step.args.map((arg) => expandHome(arg, env)), {
+    step.kind === "script"
+      ? runScript(step)
+      : runner.run(step.program, step.args.map((arg) => expandHome(arg, env)), {
           stdio: "inherit",
           env,
-          timeoutMs: options.actionTimeoutMs ?? 10 * 60_000,
-        })
-      : runScript(step);
+          timeoutMs: actionTimeoutMs,
+        });
 
   const runAction = async (action: Action, verifyLatest = false): Promise<ActionResult> => {
     const tool = CATALOG.find((candidate) => candidate.id === action.toolId);
@@ -312,7 +528,7 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
     const stateMatches = action.operation === "install" ? before.state === "missing" : before.state !== "missing";
     if (!stateMatches) {
       return {
-        ...resultBase(tool, action, before, await scanTool(tool)),
+        ...resultBase(tool, action, before, before),
         outcome: "failed",
         message: action.operation === "install" ? `${tool.label} 已在 PATH 中生效。` : `${tool.label} 未安装。`,
       };
@@ -339,10 +555,11 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
       if (after.state === "missing") return { ...base, outcome: "changed" };
       return { ...base, outcome: "failed", message: "卸载后命令仍在 PATH 中生效，可能由其他方式安装或存在残留副本。" };
     }
-    const step = actionSteps(tool, action.operation, platform)[0];
     let execution: CommandResult;
     try {
-      execution = await runStep(step);
+      execution = supportsClaudeDirectUpdate(tool, action.operation, platform) && before.source === "official"
+        ? await runClaudeNativeUpdate(tool, before)
+        : await runStep(actionSteps(tool, action.operation, platform)[0]);
     } catch (error: unknown) {
       execution = { code: null, stdout: "", stderr: "", timedOut: false, error: (error as Error).message };
     }
@@ -354,7 +571,7 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
       return { ...base, outcome: "failed", message };
     }
     if (!after.version) return { ...base, outcome: "failed", message: "动作完成，但无法重新读取版本。" };
-    if (after.version && after.version !== before.version) return { ...base, outcome: "changed" };
+    if (after.version !== before.version) return { ...base, outcome: "changed" };
     return { ...base, outcome: "unchanged", message: unchangedMessage(after) };
   };
 
@@ -363,6 +580,9 @@ export function createCliManager(options: ManagerOptions = {}): CliManager {
     preview: (action) => {
       const tool = CATALOG.find((candidate) => candidate.id === action.toolId);
       if (!tool) throw new Error(`未知工具：${action.toolId}`);
+      if (supportsClaudeDirectUpdate(tool, action.operation, platform)) {
+        return "标准 native 安装：直连 downloads.claude.ai 校验更新；其他来源：claude update";
+      }
       return actionSteps(tool, action.operation, platform).map(describeStep).join(" && ");
     },
     run: async (actions, { verifyLatest = false } = {}) => {

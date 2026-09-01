@@ -1,9 +1,8 @@
 # ai-cli-manager
 
 管理当前 `PATH` 中生效的 Claude Code、Codex、Kimi Code、Pi、OMP、MiniMax CLI 与
-Grok Build。它不盘点 `PATH` 外的副本；安装来源仅根据当前命令的 PATH 路径与符号链接
-做本地推断，不参与动作决策。`status` 默认直接查询 catalog 声明的官网 latest 端点，
-避免把本地 updater、包管理器镜像或环境配置给出的结果误写成“最新版”。
+Grok Build，不盘点 `PATH` 外的副本。安装来源根据当前命令路径推断，仅用于展示和 Claude
+更新分派；`status` 直接查询 catalog 声明的官网 latest。
 
 要求 Node.js 22.19 或更高版本。
 
@@ -64,18 +63,21 @@ updater，也不受本机 npm registry 配置影响。`status --local` 完全跳
 
 ### 安装与更新
 
-缺失工具只使用 [catalog](./src/catalog.ts) 中唯一的推荐安装入口。更新始终调用当前
-`PATH` 中生效命令自己的 updater：
+缺失工具使用 [catalog](./src/catalog.ts) 中的唯一推荐入口；更新方式如下：
 
 | 工具 | 推荐安装入口 | 更新命令 |
 | --- | --- | --- |
-| Claude Code | 官方安装脚本 | `claude update` |
+| Claude Code | 官方安装脚本 | 标准 native 安装直连官网下载校验；其他来源 `claude update` |
 | Codex | 官方安装脚本 | `codex update` |
 | Kimi Code | 官方安装脚本 | `kimi update` |
 | Pi | `npm install -g --ignore-scripts @earendil-works/pi-coding-agent` | `pi update --self` |
 | OMP | 官方安装脚本 | `omp update` |
 | MiniMax CLI | `npm install -g mmx-cli` | `mmx update` |
 | Grok Build | 官方安装脚本 | `grok update` |
+
+标准 macOS/Linux native Claude 安装会直连 downloads.claude.ai，校验 SHA-256 后原子切换
+版本软链；已是最新版时跳过下载。连续 30 秒无数据即失败且不重试。非标准 launcher 会停止
+并提示修复；其他来源和平台执行 `claude update`。相关请求不读取代理配置。
 
 交互模式先选择安装、更新或卸载，再用复选框选择工具。安装和更新默认全选，卸载默认不选；
 取消全部选项会直接结束，不执行动作，`Esc` 或 `q` 返回操作菜单。光标停在选项上时显示
@@ -88,21 +90,15 @@ stdout 连接真实终端；卸载在普通确认后还会要求一次默认 `No
 提示无法重新读取版本，请按安装器提示刷新当前 shell 或打开新终端，再运行
 `ai-cli-manager status` 核验。
 
-MiniMax CLI 上游当前版本的 `mmx update` 只打印手动更新指引（`npm update -g mmx-cli`）
-而不执行更新；若本地版本仍落后，管理器会如实报告官网最新版，不会把退出码 0 当成
-“已是最新”。
+MiniMax CLI 的 `mmx update` 可能只打印 `npm update -g mmx-cli`；版本未变时仍按官网
+latest 报告状态。
 
-Grok Build 的后台自动更新默认开启，日常使用 `grok` 本身就可能升级版本，管理器扫描到的
-版本可能在两次操作之间自行漂移；这是上游默认行为，不是异常。
+Grok Build 可能后台自动更新，因此两次扫描之间版本可能变化。
 
 ### 卸载
 
-`uninstall` 子命令必须显式列出工具名，不提供「全部卸载」。交互模式中的卸载清单默认
-不勾选任何工具；当前平台不支持的卸载项会禁用并说明原因。执行前经过两次默认 `No` 的
-确认。卸载步骤来自各工具官方文档记载的原生方式（调研见
-[native-uninstall](./docs/research/native-uninstall.md)、
-[minimax-cli](./docs/research/minimax-cli-install-and-update.md) 与
-[grok-build](./docs/research/grok-build-install-and-update.md) 研究）：
+`uninstall` 必须显式列出工具名；交互清单默认不选，执行前经过两次默认 `No` 的确认。
+不支持当前平台的工具会禁用并说明原因。
 
 | 工具 | 卸载步骤 |
 | --- | --- |
@@ -114,21 +110,15 @@ Grok Build 的后台自动更新默认开启，日常使用 `grok` 本身就可�
 | MiniMax CLI | `npm uninstall -g mmx-cli` |
 | Grok Build | `npm uninstall -g @xai-official/grok`，删除 `~/.grok/bin` 与 `~/.local/bin` 下的 `grok`/`agent` 链接，`rm -rf ~/.grok/downloads`（官方未记载卸载方式，按安装来源推断） |
 
-卸载只移除程序本身，不清理各工具的用户数据目录（`~/.claude`、`~/.codex`、
-`~/.kimi-code`、`~/.pi/agent`、`~/.omp/agent`、`~/.mmx`、`~/.grok` 等）。卸载步骤按
-各工具官方脚本的默认安装位置给出；自定义安装目录（如 `CODEX_INSTALL_DIR`、
-`KIMI_INSTALL_DIR`、`GROK_BIN_DIR`）不在覆盖范围。多个步骤尽力串行执行，单步失败
-（如 OMP 未走 Bun 安装）不阻断后续步骤。
-
-Pi 与 MiniMax CLI 的 npm 卸载跨平台一致；其余工具的卸载目前只声明了 unix 步骤，
-Windows 上会明确报告「不支持当前平台的卸载方式」。
+卸载保留用户数据，只覆盖默认安装位置；多个步骤尽力串行执行。Pi 与 MiniMax CLI 支持
+跨平台卸载，其余工具目前只支持 Unix。
 
 ### 结果与退出码
 
 每个动作结束后都会重新执行 `--version`：
 
 - 前后版本不同：显示版本变化；
-- 上游退出码为 0、版本不变：再次直连官网核验，明确显示“官网最新版”“仍低于官网
+- 动作成功但版本不变：再次直连官网核验，明确显示“官网最新版”“仍低于官网
   最新版”或“无法核验”；
 - 上游非零退出、超时或动作后版本不可读：显示“失败”。
 
@@ -140,19 +130,22 @@ Windows 上会明确报告「不支持当前平台的卸载方式」。
 - `0`：只读命令成功、用户取消，或全部动作均未失败；
 - `1`：参数错误、缺少真实终端，或至少一个动作失败。
 
-上游输出直接显示在终端中；管理器不解析上游文本，latest 结论只来自独立官网请求。
+子进程输出直接显示在终端中；latest 结论只来自独立官网请求。
 
 ## 安全与执行边界
 
 - 所有子进程均使用 `shell: false`，程序与参数分开传递；
 - 上游动作继承终端，扫描与版本复检只捕获有限大小的输出；
-- latest 请求超时为 5 秒，响应上限为 1 MiB；失败降级为“无法核验”；
+- latest 请求超时为 5 秒；请求失败或正文超过 1 MiB 时降级为“无法核验”；
 - 安装脚本只允许 catalog 中声明的 HTTPS 域名，每一跳重定向都会重新校验；
 - 脚本下载限制为 2 MiB，写入权限受限的临时文件，执行后始终清理；
-- 下载和动作均有超时；动作超时会先终止整个进程树，再强制终止；
+- Claude manifest 只接受 downloads.claude.ai 的最终响应；二进制按 manifest 的大小和
+  SHA-256 校验，在唯一临时目录准备后原子落位，`finally` 只尝试清理本次临时制品；
+- 下载和动作均有超时，下载停滞 30 秒即失败且不自动重试；子进程动作超时会先终止整个
+  进程树，再强制终止；
 - 卸载步骤复用同一执行器与计划确认流程，只删除 catalog 声明的安装路径，
   不清理用户数据目录；
 - 同一进程内的批量动作串行执行，避免同时运行多个安装器或 updater。
 
-本工具不提供跨进程锁。如果在两个终端中同时启动安装或更新，最终并发安全性由对应上游
-安装器负责；建议等待一个进程完成后再启动另一个。
+本工具不提供跨进程锁。Claude 使用唯一临时路径隔离制品，其他动作依赖上游并发安全；请勿
+同时执行多个写操作。

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import test from "node:test";
-import { access, chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -249,7 +250,7 @@ test("批量动作严格串行执行", async () => {
       return { code: 0, stdout: "", stderr: "", timedOut: false };
     },
   };
-  const manager = createCliManager({ runner, platform: "linux" });
+  const manager = createCliManager({ runner, platform: "linux", env: { PATH: "/test/bin" } });
 
   const results = await manager.run([
     { toolId: "claude", operation: "update" },
@@ -305,7 +306,7 @@ test("退出码为零但版本不变时保持中性，单项异常不阻断后�
       return { code: 0, stdout: "", stderr: "", timedOut: false };
     },
   };
-  const manager = createCliManager({ runner, platform: "linux" });
+  const manager = createCliManager({ runner, platform: "linux", env: { PATH: "/test/bin" } });
 
   assert.deepEqual(await manager.run([
     { toolId: "claude", operation: "update" },
@@ -352,6 +353,7 @@ test("更新器返回成功但仍低于官网版本时不报告最新版", async
   const manager = createCliManager({
     runner,
     platform: "linux",
+    env: { PATH: "/test/bin" },
     fetch: async () => new Response("2.0.0"),
   });
 
@@ -735,4 +737,259 @@ test("未安装的工具不能卸载", async () => {
     outcome: "failed",
     message: "Kimi Code 未安装。",
   }]);
+});
+
+async function makeNativeClaude(version: string) {
+  const home = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-claude-"));
+  const bin = path.join(home, "bin");
+  const versionsDir = path.join(home, ".local", "share", "claude", "versions");
+  await mkdir(versionsDir, { recursive: true });
+  await mkdir(bin, { recursive: true });
+  await writeFile(path.join(versionsDir, version), `claude-${version}`, { mode: 0o755 });
+  const launcher = path.join(bin, "claude");
+  await symlink(path.join(versionsDir, version), launcher);
+  return { home, bin, versionsDir, launcher };
+}
+
+function nativeClaudeRunner(launcher: string): CommandRunner {
+  return {
+    async run(program, args, options) {
+      assert.equal(program, "claude");
+      assert.deepEqual(args, ["--version"]);
+      assert.equal(options.stdio, "capture");
+      const resolved = await realpath(launcher);
+      return { code: 0, stdout: `${path.basename(resolved)} (Claude Code)`, stderr: "", timedOut: false };
+    },
+  };
+}
+
+const CLAUDE_RELEASES = "https://downloads.claude.ai/claude-code-releases";
+
+function claudeReleaseFetch(latest: string, asset: { checksum: string; size: number }, serveBinary: () => Response | Promise<Response>) {
+  const manifestEntry = { binary: "claude", checksum: asset.checksum, size: asset.size };
+  const requests: string[] = [];
+  const fetchImpl = async (input: string | URL | Request) => {
+    const url = String(input);
+    requests.push(url);
+    if (url === `${CLAUDE_RELEASES}/latest`) return new Response(latest);
+    if (url === `${CLAUDE_RELEASES}/${latest}/manifest.json`) {
+      return Response.json({ platforms: { "linux-x64": manifestEntry, "linux-x64-musl": manifestEntry } });
+    }
+    if (url.startsWith(`${CLAUDE_RELEASES}/${latest}/linux-`)) return serveBinary();
+    throw new Error(`意外请求：${url}`);
+  };
+  return { fetchImpl, requests };
+}
+
+test("Claude 标准 native 安装直连官网下载、校验并切换软链", { skip: process.platform === "win32" }, async () => {
+  const { home, bin, versionsDir, launcher } = await makeNativeClaude("2.1.241");
+  try {
+    // 目标版本占位会被替换；其他文件不属于本次动作，必须原样保留。
+    await writeFile(path.join(versionsDir, "2.1.999"), "");
+    await writeFile(path.join(versionsDir, "2.1.252"), "");
+    await writeFile(path.join(versionsDir, ".download-stale"), "partial");
+    const content = "fake-claude-2.1.252-binary";
+    const { fetchImpl } = claudeReleaseFetch(
+      "2.1.252",
+      { checksum: createHash("sha256").update(content).digest("hex"), size: content.length },
+      () => new Response(content),
+    );
+    const manager = createCliManager({
+      runner: nativeClaudeRunner(launcher),
+      platform: "linux",
+      arch: "x64",
+      env: { PATH: bin, HOME: home },
+      fetch: fetchImpl,
+    });
+
+    assert.deepEqual(await manager.run([{ toolId: "claude", operation: "update" }]), [{
+      toolId: "claude",
+      label: "Claude Code",
+      operation: "update",
+      outcome: "changed",
+      beforeVersion: "2.1.241",
+      afterVersion: "2.1.252",
+    }]);
+    assert.equal(await readFile(path.join(versionsDir, "2.1.252"), "utf8"), content);
+    assert.equal(await realpath(launcher), await realpath(path.join(versionsDir, "2.1.252")));
+    assert.equal(await readFile(path.join(versionsDir, "2.1.241"), "utf8"), "claude-2.1.241");
+    assert.equal(await readFile(path.join(versionsDir, "2.1.999"), "utf8"), "");
+    assert.equal(await readFile(path.join(versionsDir, ".download-stale"), "utf8"), "partial");
+    assert.deepEqual((await readdir(versionsDir)).filter((entry) => entry.startsWith(".ai-cli-manager-")), []);
+    assert.deepEqual((await readdir(bin)).filter((entry) => entry.startsWith(".ai-cli-manager-")), []);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+const corruptedContent = "corrupted-binary-content";
+const oversizedContent = "oversized-binary-content";
+for (const failure of [
+  { name: "SHA-256 校验失败", content: corruptedContent, checksum: createHash("sha256").update("official-binary-content").digest("hex"), size: corruptedContent.length, message: /SHA-256 校验失败/ },
+  { name: "超过发布清单大小", content: oversizedContent, checksum: createHash("sha256").update(oversizedContent).digest("hex"), size: oversizedContent.length - 1, message: /超过发布清单大小/ },
+] as const) {
+  test(`Claude 直连下载 ${failure.name}会停止且清理本次临时目录`, { skip: process.platform === "win32" }, async () => {
+    const { home, bin, versionsDir, launcher } = await makeNativeClaude("2.1.241");
+    try {
+      const { fetchImpl, requests } = claudeReleaseFetch(
+        "2.1.252",
+        { checksum: failure.checksum, size: failure.size },
+        () => new Response(failure.content),
+      );
+      const manager = createCliManager({
+        runner: nativeClaudeRunner(launcher),
+        platform: "linux",
+        arch: "x64",
+        env: { PATH: bin, HOME: home },
+        fetch: fetchImpl,
+      });
+
+      const [result] = await manager.run([{ toolId: "claude", operation: "update" }]);
+      assert.equal(result?.outcome, "failed");
+      assert.match(result?.message ?? "", failure.message);
+      assert.equal(requests.filter((url) => url.includes("/linux-")).length, 1);
+      assert.equal(await realpath(launcher), await realpath(path.join(versionsDir, "2.1.241")));
+      assert.deepEqual((await readdir(versionsDir)).filter((entry) => entry.startsWith(".ai-cli-manager-")), []);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}
+
+test("Claude 直连下载停滞会被超时掐断且不重试", { skip: process.platform === "win32" }, async () => {
+  const { home, bin, versionsDir, launcher } = await makeNativeClaude("2.1.241");
+  try {
+    const content = "stalled-binary";
+    const { fetchImpl, requests } = claudeReleaseFetch(
+      "2.1.252",
+      { checksum: createHash("sha256").update(content).digest("hex"), size: content.length },
+      () => new Response(new ReadableStream({ start() {} })),
+    );
+    const manager = createCliManager({
+      runner: nativeClaudeRunner(launcher),
+      platform: "linux",
+      arch: "x64",
+      env: { PATH: bin, HOME: home },
+      fetch: fetchImpl,
+      downloadStallMs: 50,
+    });
+
+    const [result] = await manager.run([{ toolId: "claude", operation: "update" }]);
+    assert.equal(result?.outcome, "failed");
+    assert.match(result?.message ?? "", /下载停滞/);
+    assert.equal(requests.filter((url) => url.includes("/linux-")).length, 1);
+    assert.equal(await realpath(launcher), await realpath(path.join(versionsDir, "2.1.241")));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("Claude 软链切换失败仍会清理本次临时目录和软链", { skip: process.platform === "win32" }, async () => {
+  const { home, bin, versionsDir, launcher } = await makeNativeClaude("2.1.241");
+  try {
+    const latest = "2.1.252";
+    const content = "fake-claude-2.1.252-binary";
+    const { fetchImpl } = claudeReleaseFetch(latest, {
+      checksum: createHash("sha256").update(content).digest("hex"),
+      size: content.length,
+    }, async () => {
+      // 用非空目录占住 launcher，迫使原子软链切换失败。
+      await rm(launcher, { force: true });
+      await mkdir(launcher);
+      await writeFile(path.join(launcher, "block"), "block");
+      return new Response(content);
+    });
+    const manager = createCliManager({
+      runner: nativeClaudeRunner(launcher),
+      platform: "linux",
+      arch: "x64",
+      env: { PATH: bin, HOME: home },
+      fetch: fetchImpl,
+    });
+
+    const [result] = await manager.run([{ toolId: "claude", operation: "update" }]);
+    assert.equal(result?.outcome, "failed");
+    assert.match(result?.message ?? "", /安装 2\.1\.252 失败/);
+    assert.deepEqual((await readdir(versionsDir)).filter((entry) => entry.startsWith(".ai-cli-manager-")), []);
+    assert.deepEqual((await readdir(bin)).filter((entry) => entry.startsWith(".ai-cli-manager-")), []);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("Claude 已是官网最新版时跳过下载", { skip: process.platform === "win32" }, async () => {
+  const { home, bin, launcher } = await makeNativeClaude("2.1.252");
+  try {
+    const { fetchImpl } = claudeReleaseFetch(
+      "2.1.252",
+      { checksum: "0".repeat(64), size: 1 },
+      () => { throw new Error("不应下载"); },
+    );
+    const manager = createCliManager({
+      runner: nativeClaudeRunner(launcher),
+      platform: "linux",
+      arch: "x64",
+      env: { PATH: bin, HOME: home },
+      fetch: fetchImpl,
+    });
+
+    assert.deepEqual(await manager.run([{ toolId: "claude", operation: "update" }], { verifyLatest: true }), [{
+      toolId: "claude",
+      label: "Claude Code",
+      operation: "update",
+      outcome: "unchanged",
+      beforeVersion: "2.1.252",
+      afterVersion: "2.1.252",
+      message: "已是官网最新版 2.1.252。",
+    }]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("Claude launcher 不指向 versions 目录时停止直连更新且不访问网络", { skip: process.platform === "win32" }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "ai-cli-manager-claude-odd-"));
+  try {
+    const localBin = path.join(home, ".local", "bin");
+    const other = path.join(home, "other");
+    await mkdir(localBin, { recursive: true });
+    await mkdir(other, { recursive: true });
+    await writeFile(path.join(other, "claude"), "user-replaced", { mode: 0o755 });
+    await symlink(path.join(other, "claude"), path.join(localBin, "claude"));
+    const manager = createCliManager({
+      runner: new LocalCliRunner({ claude: "2.1.241 (Claude Code)" }),
+      platform: "linux",
+      arch: "x64",
+      env: { PATH: localBin, HOME: home },
+      fetch: async (input) => {
+        throw new Error(`不应访问网络：${String(input)}`);
+      },
+    });
+
+    const [result] = await manager.run([{ toolId: "claude", operation: "update" }]);
+    assert.equal(result?.outcome, "failed");
+    assert.match(result?.message ?? "", /已停止直连更新/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("只有 Claude macOS/Linux 更新使用直连特例", () => {
+  assert.equal(
+    createCliManager({ platform: "linux" }).preview({ toolId: "claude", operation: "update" }),
+    "标准 native 安装：直连 downloads.claude.ai 校验更新；其他来源：claude update",
+  );
+  assert.equal(
+    createCliManager({ platform: "win32" }).preview({ toolId: "claude", operation: "update" }),
+    "claude update",
+  );
+  assert.equal(
+    createCliManager({ platform: "freebsd" }).preview({ toolId: "claude", operation: "update" }),
+    "claude update",
+  );
+  const manager = createCliManager({ platform: "linux" });
+  assert.deepEqual(
+    (["codex", "kimi", "pi", "omp", "mmx", "grok"] as const).map((toolId) => manager.preview({ toolId, operation: "update" })),
+    ["codex update", "kimi update", "pi update --self", "omp update", "mmx update", "grok update"],
+  );
 });

@@ -142,7 +142,7 @@ async function runInteractive(manager: CliManager): Promise<number> {
       message: "现在要做什么？",
       choices: [
         ...(canInstall ? [{ name: "安装缺失工具", value: "install" as const, description: "使用 catalog 中唯一的推荐入口" }] : []),
-        ...(canManage ? [{ name: "更新已安装工具", value: "update" as const, description: "把终端交给各 CLI updater" }] : []),
+        ...(canManage ? [{ name: "更新已安装工具", value: "update" as const, description: "Claude 直连官网下载校验，其余交给各 CLI updater" }] : []),
         ...(canManage ? [{ name: "卸载已安装工具", value: "uninstall" as const, description: "仅移除程序，保留用户数据" }] : []),
         { name: "退出", value: "cancel" as const },
       ],
